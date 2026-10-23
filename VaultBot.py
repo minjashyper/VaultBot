@@ -39,7 +39,6 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "skip_download": True,
-    "cookiefile": "/home/container/cookies.txt",
 }
 FFMPEG_OPTIONS = {"options": "-vn"}
 
