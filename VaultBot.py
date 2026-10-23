@@ -4,8 +4,11 @@ load_dotenv("/home/container/.env")
 
 import asyncio
 import base64
+import faulthandler
 import os
 import shutil
+import signal
+import sys
 import tempfile
 from collections import deque
 from dataclasses import dataclass
@@ -77,6 +80,75 @@ else:
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 
 
+# -------------------- Diagnostics (temporary) --------------------
+# These lines help find out why the host restarts the bot during a song
+# request. They only print to the console; they do not change how the bot works.
+faulthandler.enable()  # prints a traceback if Python itself crashes hard
+
+
+def _peak_ram_mb() -> str:
+    try:
+        import resource
+        return f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f}MB"
+    except Exception:
+        return "?"
+
+
+def _read_first(paths) -> str:
+    for p in paths:
+        try:
+            return Path(p).read_text().strip()
+        except Exception:
+            continue
+    return "n/a"
+
+
+def diag(message: str) -> None:
+    print(f"[diag] {message} (peak RAM so far: {_peak_ram_mb()})", flush=True)
+
+
+def _on_stop_signal(signum, frame):
+    name = signal.Signals(signum).name
+    print(f"[diag] Received {name}: the host is asking the bot to stop.", flush=True)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+    if _sig is not None:
+        try:
+            signal.signal(_sig, _on_stop_signal)
+        except Exception:
+            pass
+
+# oom_kill > 0 here (it counts since the container started) means the host
+# killed the bot for using too much memory.
+diag(
+    "memory limit: "
+    + _read_first(["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"])
+    + " | memory events: "
+    + _read_first(["/sys/fs/cgroup/memory.events"]).replace("\n", ", ")
+)
+diag(f"ffmpeg found: {shutil.which('ffmpeg')} | node: {shutil.which('node')} | deno: {shutil.which('deno')}")
+
+
+class YTDLLogger:
+    """Print yt-dlp's own messages to the console so we can see where it stops."""
+
+    def debug(self, msg):
+        if not msg.startswith("[download]") or "Destination" in msg or "100%" in msg:
+            print(f"[yt-dlp] {msg}", flush=True)
+
+    def info(self, msg):
+        print(f"[yt-dlp] {msg}", flush=True)
+
+    def warning(self, msg):
+        print(f"[yt-dlp warning] {msg}", flush=True)
+
+    def error(self, msg):
+        print(f"[yt-dlp error] {msg}", flush=True)
+
+
 # Per-server music state.
 queues: dict[int, deque] = {}
 current_tracks: dict[int, "Track"] = {}
@@ -142,10 +214,13 @@ async def extract_track(query: str, requester: str) -> Track:
             "skip_download": False,
             "quiet": True,
             "no_warnings": False,
+            "logger": YTDLLogger(),
         })
         try:
+            diag("extract: looking up the video")
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(query, download=False)
+                diag("extract: lookup finished, starting download")
                 if "entries" in info:
                     info = next((entry for entry in info["entries"] if entry), None)
                 if not info:
@@ -153,6 +228,7 @@ async def extract_track(query: str, requester: str) -> Track:
                 webpage_url = info.get("webpage_url") or info.get("original_url") or query
                 # Download the selected item rather than retaining an expiring stream URL.
                 downloaded = ydl.extract_info(webpage_url, download=True)
+                diag("extract: download finished")
                 requested = (downloaded or {}).get("requested_downloads") or []
                 path = requested[0].get("filepath") if requested else None
                 if not path or not Path(path).is_file():
@@ -322,12 +398,14 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     """Play a song name, supported URL, or attached MP3/WAV/Opus file."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
+    diag(f"~play received: {query[:80]!r}")
     try:
         await ensure_voice(ctx)
     except Exception as exc:
         return await ctx.send(str(exc))
+    diag("joined voice, continuing")
 
-    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
+    attachment =ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment:
         suffix = Path(urlparse(attachment.filename).path).suffix.lower()
         if suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}:
@@ -364,10 +442,11 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     await ctx.typing()
     try:
         track = await extract_track(query.strip(), ctx.author.display_name)
+        diag(f"track ready: {track.title!r}, queueing")
         await queue_track(ctx, track)
     except Exception as exc:
         error_text = str(exc)
-        print(f"yt-dlp error: {error_text}")
+        print(f"yt-dlp error: {error_text}", flush=True)
         if "confirm you" in error_text and "not a bot" in error_text:
             await ctx.send(
                 "⚠️ YouTube is blocking this bot's server. The YouTube cookies are "
