@@ -39,7 +39,18 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "skip_download": True,
+    "/home/container/cookies.txt"
 }
+import base64
+
+COOKIE_PATH = "/home/container/cookies.txt"
+_cookies_b64 = os.getenv("COOKIES_B64")
+if _cookies_b64:
+    try:
+        Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64))
+        YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
+    except Exception as exc:
+        print(f"Could not write cookies file: {exc}")
 FFMPEG_OPTIONS = {"options": "-vn"}
 
 
