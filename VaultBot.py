@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 load_dotenv("/home/container/.env")
 
 import asyncio
+import base64
 import os
 import shutil
 import tempfile
@@ -39,19 +40,28 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "skip_download": True,
-    "/home/container/cookies.txt"
 }
-import base64
+FFMPEG_OPTIONS = {"options": "-vn"}
 
-COOKIE_PATH = "/home/container/cookies.txt"
+# -------------------- YouTube cookies --------------------
+# Option A: put your cookies in the host's .env as COOKIES_B64 (base64 of
+# cookies.txt). The bot rebuilds cookies.txt from it every startup, so the
+# cookies never have to be committed to GitHub.
+# Option B: upload cookies.txt to /home/container/ with the host's file manager.
+COOKIE_PATH = os.getenv("COOKIE_FILE", "/home/container/cookies.txt")
 _cookies_b64 = os.getenv("COOKIES_B64")
 if _cookies_b64:
     try:
         Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64))
-        YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
+        print(f"Wrote YouTube cookies file from COOKIES_B64 to {COOKIE_PATH}")
     except Exception as exc:
-        print(f"Could not write cookies file: {exc}")
-FFMPEG_OPTIONS = {"options": "-vn"}
+        print(f"Could not write cookies file from COOKIES_B64: {exc}")
+
+if Path(COOKIE_PATH).is_file():
+    YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
+    print(f"yt-dlp will use cookies from {COOKIE_PATH}")
+else:
+    print("WARNING: No YouTube cookies file found. YouTube may block this host's IP.")
 
 
 # Per-server music state.
@@ -343,12 +353,21 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         track = await extract_track(query.strip(), ctx.author.display_name)
         await queue_track(ctx, track)
     except Exception as exc:
-        await ctx.send(
-            "I couldn't find a playable stream for that request. "
-            "For Spotify/Apple Music, direct playback may not be available; "
-            "try a public YouTube/SoundCloud URL or a song title.\n"
-            f"Details: {str(exc)[:250]}"
-        )
+        error_text = str(exc)
+        print(f"yt-dlp error: {error_text}")
+        if "confirm you" in error_text and "not a bot" in error_text:
+            await ctx.send(
+                "⚠️ YouTube is blocking this bot's server. The YouTube cookies are "
+                "missing, expired, or not being accepted. The bot owner needs to "
+                "export fresh cookies (see the setup notes) and restart the bot."
+            )
+        else:
+            await ctx.send(
+                "I couldn't find a playable stream for that request. "
+                "For Spotify/Apple Music, direct playback may not be available; "
+                "try a public YouTube/SoundCloud URL or a song title.\n"
+                f"Details: {error_text[:250]}"
+            )
 
 
 @bot.command(name="queue", aliases=["q"])
