@@ -1,7 +1,30 @@
+"""
+VaultBot — a Discord music + community bot.
+
+File layout
+-----------
+ 1. Imports
+ 2. Configuration & constants
+ 3. Bot setup
+ 4. yt-dlp & YouTube cookies
+ 5. Diagnostics (temporary)
+ 6. Music state, data types & helpers
+ 7. Music engine (extract / queue / playback)
+ 8. Juice WRLD integration (API, tracker feed)
+ 9. Help system (multi-page command list)
+10. Events & error handling
+11. Prefix commands (music, Juice WRLD, help)
+12. Slash commands
+13. Startup
+"""
+
 from dotenv import load_dotenv
 
 load_dotenv("/home/container/.env")
 
+# =============================================================================
+# 1. IMPORTS
+# =============================================================================
 import asyncio
 import base64
 import faulthandler
@@ -13,6 +36,7 @@ import sys
 import tempfile
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlencode
@@ -22,18 +46,61 @@ import discord
 from discord.ext import commands, tasks
 import yt_dlp
 
+
+# =============================================================================
+# 2. CONFIGURATION & CONSTANTS
+# =============================================================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Keep the existing prefix. Message Content Intent must also be enabled
 # for this bot in the Discord Developer Portal.
+PREFIX = "~"
+
+# Embed colours.
+BRAND_COLOR = discord.Color.from_rgb(28, 27, 32)
+JUICE_COLOR = discord.Color.from_rgb(123, 44, 191)
+
+# Music settings.
+DEFAULT_VOLUME = 0.5
+ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
+MAX_UPLOAD_MB = 20
+
+# Juice WRLD API settings.
+# Public read endpoints are used by default; no API key is required for them.
+# If your API account requires a key, set JUICEWRLD_API_KEY in the host's
+# environment settings. Never commit tokens or API keys to GitHub.
+JUICEWRLD_API_BASE = os.getenv(
+    "JUICEWRLD_API_BASE",
+    "https://juicewrldapi.com/juicewrld"
+).rstrip("/")
+JUICEWRLD_API_KEY = os.getenv("JUICEWRLD_API_KEY")
+JUICEWRLD_CHANNEL_ID = os.getenv("JUICEWRLD_CHANNEL_ID")
+JUICEWRLD_POLL_MINUTES = max(
+    1, int(os.getenv("JUICEWRLD_POLL_MINUTES", "5"))
+)
+JUICEWRLD_STATE_FILE = Path(os.getenv(
+    "JUICEWRLD_STATE_FILE",
+    str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
+))
+
+
+# =============================================================================
+# 3. BOT SETUP
+# =============================================================================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 intents.messages = True
 
-bot = commands.Bot(command_prefix="~", intents=intents)
+# help_command=None disables discord.py's built-in help so the custom
+# multi-page help in section 9 can take over the ~help command.
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
+
+# =============================================================================
+# 4. YT-DLP & YOUTUBE COOKIES
+# =============================================================================
 # yt-dlp settings. This resolves public, playable media sources; it does not
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
@@ -48,7 +115,7 @@ YTDL_OPTIONS = {
 }
 FFMPEG_OPTIONS = {"options": "-vn"}
 
-# -------------------- YouTube cookies --------------------
+
 # Put your cookies in the host's environment variables as base64 of cookies.txt.
 # The host limits each variable to 2000 characters, so the base64 text can be
 # split across COOKIES_B64_1, COOKIES_B64_2, COOKIES_B64_3, ... (in order).
@@ -82,7 +149,26 @@ else:
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 
 
-# -------------------- Diagnostics (temporary) --------------------
+class YTDLLogger:
+    """Print yt-dlp's own messages to the console so we can see where it stops."""
+
+    def debug(self, msg):
+        if not msg.startswith("[download]") or "Destination" in msg or "100%" in msg:
+            print(f"[yt-dlp] {msg}", flush=True)
+
+    def info(self, msg):
+        print(f"[yt-dlp] {msg}", flush=True)
+
+    def warning(self, msg):
+        print(f"[yt-dlp warning] {msg}", flush=True)
+
+    def error(self, msg):
+        print(f"[yt-dlp error] {msg}", flush=True)
+
+
+# =============================================================================
+# 5. DIAGNOSTICS (temporary)
+# =============================================================================
 # These lines help find out why the host restarts the bot during a song
 # request. They only print to the console; they do not change how the bot works.
 faulthandler.enable()  # prints a traceback if Python itself crashes hard
@@ -134,23 +220,9 @@ diag(
 diag(f"ffmpeg found: {shutil.which('ffmpeg')} | node: {shutil.which('node')} | deno: {shutil.which('deno')}")
 
 
-class YTDLLogger:
-    """Print yt-dlp's own messages to the console so we can see where it stops."""
-
-    def debug(self, msg):
-        if not msg.startswith("[download]") or "Destination" in msg or "100%" in msg:
-            print(f"[yt-dlp] {msg}", flush=True)
-
-    def info(self, msg):
-        print(f"[yt-dlp] {msg}", flush=True)
-
-    def warning(self, msg):
-        print(f"[yt-dlp warning] {msg}", flush=True)
-
-    def error(self, msg):
-        print(f"[yt-dlp error] {msg}", flush=True)
-
-
+# =============================================================================
+# 6. MUSIC STATE, DATA TYPES & HELPERS
+# =============================================================================
 # Per-server music state.
 queues: dict[int, deque] = {}
 current_tracks: dict[int, "Track"] = {}
@@ -203,6 +275,23 @@ def clean_temp_file(path: Optional[str]) -> None:
     TEMP_FILES.discard(path)
 
 
+def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> discord.Embed:
+    """Embed shown by the 'Now Playing' announcement and ~nowplaying."""
+    embed = discord.Embed(
+        title="🎶 Now Playing",
+        description=f"[{discord.utils.escape_markdown(track.title)}]({track.webpage_url})",
+        color=BRAND_COLOR,
+    )
+    embed.add_field(name="Duration", value=format_duration(track.duration), inline=True)
+    embed.add_field(name="Requested by", value=track.requester, inline=True)
+    if loop_mode is not None:
+        embed.set_footer(text=f"Loop: {loop_mode}")
+    return embed
+
+
+# =============================================================================
+# 7. MUSIC ENGINE
+# =============================================================================
 async def extract_track(query: str, requester: str) -> Track:
     """Resolve and download a playable track so live YouTube URLs cannot expire mid-song."""
     def _extract():
@@ -264,14 +353,7 @@ async def extract_track(query: str, requester: str) -> Track:
 
 
 async def update_now_playing(ctx: commands.Context, track: Track) -> None:
-    embed = discord.Embed(
-        title="🎶 Now Playing",
-        description=f"[{discord.utils.escape_markdown(track.title)}]({track.webpage_url})",
-        color=discord.Color.from_rgb(28, 27, 32),
-    )
-    embed.add_field(name="Duration", value=format_duration(track.duration), inline=True)
-    embed.add_field(name="Requested by", value=track.requester, inline=True)
-    embed.set_footer(text=f"Loop: {loop_modes.get(ctx.guild.id, 'off')}")
+    embed = build_now_playing_embed(track, loop_modes.get(ctx.guild.id, "off"))
     try:
         msg = await ctx.send(embed=embed)
         now_playing_messages[ctx.guild.id] = msg
@@ -305,7 +387,7 @@ async def play_next(ctx: commands.Context) -> None:
 
         track = get_queue(guild_id).popleft()
         current_tracks[guild_id] = track
-        volume = volumes.get(guild_id, 0.5)
+        volume = volumes.get(guild_id, DEFAULT_VOLUME)
 
         try:
             if not track.local_path or not Path(track.local_path).is_file():
@@ -366,25 +448,9 @@ async def queue_track(ctx: commands.Context, track: Track) -> None:
         await play_next(ctx)
 
 
-
-# -------------------- Juice WRLD API integration --------------------
-# Public read endpoints are used by default; no API key is required for them.
-# If your API account requires a key, set JUICEWRLD_API_KEY in the host's
-# environment settings. Never commit tokens or API keys to GitHub.
-JUICEWRLD_API_BASE = os.getenv(
-    "JUICEWRLD_API_BASE",
-    "https://juicewrldapi.com/juicewrld"
-).rstrip("/")
-JUICEWRLD_API_KEY = os.getenv("JUICEWRLD_API_KEY")
-JUICEWRLD_CHANNEL_ID = os.getenv("JUICEWRLD_CHANNEL_ID")
-JUICEWRLD_POLL_MINUTES = max(
-    1, int(os.getenv("JUICEWRLD_POLL_MINUTES", "5"))
-)
-JUICEWRLD_STATE_FILE = Path(os.getenv(
-    "JUICEWRLD_STATE_FILE",
-    str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
-))
-
+# =============================================================================
+# 8. JUICE WRLD INTEGRATION
+# =============================================================================
 _juicewrld_seen: set[str] = set()
 _juicewrld_state_loaded = False
 _juicewrld_baseline_initialized = False
@@ -520,7 +586,7 @@ async def juicewrld_tracker_task():
             embed = discord.Embed(
                 title=f"🎵 Juice WRLD Tracker Update: {title}",
                 description=f"**Action:** {action}\n**Updated by:** {editor}",
-                color=discord.Color.from_rgb(123, 44, 191)
+                color=JUICE_COLOR
             )
 
             changed_fields = item.get("fields")
@@ -545,7 +611,6 @@ async def juicewrld_tracker_task():
             timestamp = item.get("timestamp")
             if timestamp:
                 try:
-                    from datetime import datetime
                     parsed = datetime.fromisoformat(
                         str(timestamp).replace("Z", "+00:00")
                     )
@@ -585,55 +650,364 @@ async def _before_juicewrld_tracker_task():
     await bot.wait_until_ready()
 
 
-@bot.command(name="jwsong")
-async def juicewrld_song_search(ctx: commands.Context, *, query: str):
-    """Search Juice WRLD catalog metadata. Usage: ~jwsong lucid dreams"""
-    try:
-        payload = await _juicewrld_api_get(
-            "/songs/",
-            params={"search": query, "page_size": 5}
+# =============================================================================
+# 9. HELP SYSTEM (multi-page command list)
+# =============================================================================
+# To add or edit a page, change an entry in HELP_PAGES. Everything else
+# (dropdown, buttons, page counter, `~help <topic>`, `/help`) updates itself.
+#
+#   key      - short name used by `~help <key>` and the /help page choice
+#   aliases  - extra words that also jump to this page (e.g. `~help volume`)
+#   emoji    - icon shown in the title and dropdown
+#   title    - page name
+#   summary  - one-line blurb for the dropdown (max 100 characters)
+#   color    - embed colour
+#   description / fields - the page content (field values max 1024 characters)
+HELP_PAGES: list[dict] = [
+    {
+        "key": "home",
+        "aliases": ("overview", "start", "main"),
+        "emoji": "🏠",
+        "title": "Overview",
+        "summary": "What VaultBot does and where to find everything",
+        "color": BRAND_COLOR,
+        "description": (
+            "VaultBot plays music in your voice channels, looks up Juice WRLD "
+            "catalog info, and gives staff tools for posting releases and "
+            "announcements.\n\n"
+            f"**Prefix commands** start with `{PREFIX}` and **slash commands** "
+            "start with `/`.\n"
+            "Use the ◀ ▶ buttons or the dropdown below to browse every feature."
+        ),
+        "fields": [
+            (
+                "🎵 Music Player — pages 2 & 3",
+                "Play songs by name or link, or upload your own audio file. "
+                "Comes with a queue, loop modes, volume control, and more.",
+            ),
+            (
+                "🧃 Juice WRLD Tools — page 4",
+                "Search the Juice WRLD catalog and get automatic tracker "
+                "updates posted to a channel.",
+            ),
+            (
+                "📣 Server Tools — page 5",
+                "Slash commands for posting music releases, sending "
+                "announcements, and checking the bot's latency.",
+            ),
+            (
+                "💡 Tips & Troubleshooting — page 6",
+                "Requirements, supported sources, and fixes for common problems.",
+            ),
+        ],
+    },
+    {
+        "key": "music",
+        "aliases": ("play", "queue", "skip", "stop", "playback"),
+        "emoji": "🎵",
+        "title": "Music: Play & Queue",
+        "summary": "Play songs, upload files, view the queue, skip, stop",
+        "color": BRAND_COLOR,
+        "description": (
+            "Join a voice channel, then use these commands. The bot joins "
+            "you automatically and starts playing as soon as a song is ready."
+        ),
+        "fields": [
+            (
+                f"`{PREFIX}play <song or URL>`  •  `{PREFIX}p`",
+                "Searches for the song (or opens the link you give it), "
+                "downloads the audio, and adds it to the queue. If nothing is "
+                "playing, it starts right away.",
+            ),
+            (
+                f"`{PREFIX}play` + an attached file",
+                "Plays an audio file you upload straight from Discord. "
+                f"Supports MP3, WAV, Opus, OGG, M4A, and FLAC up to {MAX_UPLOAD_MB} MB.",
+            ),
+            (
+                f"`{PREFIX}queue`  •  `{PREFIX}q`",
+                "Shows what's playing now, the next 10 songs in line, how many "
+                "more are queued, and the current loop mode.",
+            ),
+            (
+                f"`{PREFIX}skip`  •  `{PREFIX}s`",
+                "Skips the current song and moves on to the next one in the queue.",
+            ),
+            (
+                f"`{PREFIX}stop`",
+                "Stops playback, clears the whole queue, and disconnects the bot "
+                "from voice.",
+            ),
+        ],
+    },
+    {
+        "key": "controls",
+        "aliases": ("volume", "loop", "pause", "resume", "nowplaying", "leave"),
+        "emoji": "🎛️",
+        "title": "Music: Controls & Loop",
+        "summary": "Pause, resume, volume, now playing, loop modes, leave",
+        "color": BRAND_COLOR,
+        "description": "Fine-tune playback while a song is going.",
+        "fields": [
+            (
+                f"`{PREFIX}pause`  /  `{PREFIX}resume`  •  `{PREFIX}unpause`",
+                "Pause the current song and pick it back up right where you left off.",
+            ),
+            (
+                f"`{PREFIX}volume <0-100>`  •  `{PREFIX}vol`",
+                "Sets the playback volume for this server. "
+                f"The default is {int(DEFAULT_VOLUME * 100)}%. "
+                "The change applies instantly, even mid-song.",
+            ),
+            (
+                f"`{PREFIX}nowplaying`  •  `{PREFIX}np`  •  `{PREFIX}current`",
+                "Shows the current song with a link, its duration, and who requested it.",
+            ),
+            (
+                f"`{PREFIX}loop <song|queue|off>`",
+                "**song** — repeats the current track\n"
+                "**queue** — cycles through the whole queue forever\n"
+                "**off** — plays normally (default)\n"
+                "*Also accepts `track`, `all`, and `none`.* "
+                f"Using `{PREFIX}skip` while on **song** loop turns the loop off.",
+            ),
+            (
+                f"`{PREFIX}leave`  •  `{PREFIX}disconnect`",
+                "Clears the queue and disconnects the bot from the voice channel.",
+            ),
+        ],
+    },
+    {
+        "key": "juice",
+        "aliases": ("jw", "jwsong", "tracker", "juicewrld"),
+        "emoji": "🧃",
+        "title": "Juice WRLD Tools",
+        "summary": "Catalog search and automatic tracker updates",
+        "color": JUICE_COLOR,
+        "description": (
+            "Catalog features powered by the Juice WRLD API. Information only — "
+            "these tools don't play audio."
+        ),
+        "fields": [
+            (
+                f"`{PREFIX}jwsong <search>`",
+                "Searches the Juice WRLD catalog and shows up to 5 matches with "
+                "the artist, category, album, and catalog ID.\n"
+                f"Example: `{PREFIX}jwsong lucid dreams`",
+            ),
+            (
+                "📡 Automatic Tracker Feed",
+                "When the bot owner picks a channel for it, VaultBot checks the "
+                "tracker on a timer and posts every new update: the song name, "
+                "what happened, who updated it, which fields changed, and any "
+                "notes.\n"
+                "*A tracker update isn't necessarily a new release.*",
+            ),
+        ],
+    },
+    {
+        "key": "slash",
+        "aliases": ("server", "admin", "staff", "announce", "musicdrop", "ping"),
+        "emoji": "📣",
+        "title": "Server Tools (Slash Commands)",
+        "summary": "/musicdrop, /announce, /ping and /help",
+        "color": BRAND_COLOR,
+        "description": "Type `/` in the message box to see these. Some are staff-only.",
+        "fields": [
+            (
+                "`/musicdrop`  🔒 Manage Messages",
+                "Posts a polished music release in a channel of your choice: "
+                "title, description, square artwork, an artist footer, and "
+                "**mp3** / **wav** download buttons.\n"
+                "Options: `channel`, `title`, `description`, `artist`, "
+                "`artwork_url`, `mp3_url`, `wav_url`.\n"
+                "Links must be HTTPS, and the bot needs Send Messages + Embed "
+                "Links in the target channel.",
+            ),
+            (
+                "`/announce`  🔒 Administrator",
+                "Sends an announcement to any channel. Set `ping_everyone` to "
+                "True to include an @everyone ping (off by default).",
+            ),
+            (
+                "`/ping`",
+                "Checks that the bot is online and shows its latency. "
+                "Only you can see the reply.",
+            ),
+            (
+                "`/help`",
+                "Opens this command list. You can jump straight to a section "
+                f"too, or use `{PREFIX}help` for the same menu.",
+            ),
+        ],
+    },
+    {
+        "key": "tips",
+        "aliases": ("faq", "troubleshooting", "problems", "info"),
+        "emoji": "💡",
+        "title": "Tips & Troubleshooting",
+        "summary": "Requirements, supported sources, and common fixes",
+        "color": BRAND_COLOR,
+        "description": "Quick answers if something isn't working the way you expect.",
+        "fields": [
+            (
+                "🔊 Before you play",
+                "Join a voice channel first — the bot follows you in. It needs "
+                "**Connect** and **Speak** permissions, plus **Send Messages** "
+                "and **Embed Links** in the text channel.",
+            ),
+            (
+                "🔗 What you can play",
+                "Song names (searched automatically), public links that yt-dlp "
+                "supports such as YouTube and SoundCloud, and uploaded audio "
+                "files. Each command adds a single track, not a full playlist.\n"
+                "Spotify and Apple Music links can't be streamed directly — use "
+                "the song title or a YouTube/SoundCloud link instead.",
+            ),
+            (
+                "⚠️ If something goes wrong",
+                "**\"YouTube is blocking this bot\"** — the bot owner needs to "
+                "refresh the YouTube cookies and restart the bot.\n"
+                "**\"Couldn't play\"** — try the song again or use a different link.\n"
+                "**\"Missing argument\"** — check the usage shown for that "
+                "command on the earlier pages.",
+            ),
+            (
+                "🧭 Using this menu",
+                "Only the person who opened the menu can use its buttons. It "
+                f"stops responding after 2 minutes, so just run `{PREFIX}help` "
+                "or `/help` again. Jump to a page directly, e.g. "
+                f"`{PREFIX}help music` or `{PREFIX}help juice`.",
+            ),
+        ],
+    },
+]
+
+
+def find_help_page(topic: Optional[str]) -> int:
+    """Turn a topic like 'music', 'volume' or '3' into a page index (default: 0)."""
+    topic = (topic or "").strip().lower()
+    if not topic:
+        return 0
+    if topic.isdigit():
+        number = int(topic)
+        return number - 1 if 1 <= number <= len(HELP_PAGES) else 0
+    for index, page in enumerate(HELP_PAGES):
+        if topic == page["key"] or topic in page["aliases"]:
+            return index
+    return 0
+
+
+def build_help_embed(index: int) -> discord.Embed:
+    page = HELP_PAGES[index]
+    embed = discord.Embed(
+        title=f"{page['emoji']} VaultBot — {page['title']}",
+        description=page["description"],
+        color=page["color"],
+    )
+    for name, value in page["fields"]:
+        embed.add_field(name=name, value=value, inline=False)
+
+    # Live status line on the Juice WRLD page.
+    if page["key"] == "juice":
+        if JUICEWRLD_CHANNEL_ID:
+            status = f"✅ Enabled — checks every {JUICEWRLD_POLL_MINUTES} minute(s)."
+        else:
+            status = "❌ Not enabled on this bot (the owner hasn't set a channel)."
+        embed.add_field(name="Tracker status", value=status, inline=False)
+
+    embed.set_footer(
+        text=f"Page {index + 1} of {len(HELP_PAGES)}  •  Prefix: {PREFIX}  •  Slash: /"
+    )
+    return embed
+
+
+_HELP_SELECT_OPTIONS = [
+    discord.SelectOption(
+        label=f"{i + 1}. {page['title']}"[:100],
+        value=str(i),
+        description=page["summary"][:100],
+        emoji=page["emoji"],
+    )
+    for i, page in enumerate(HELP_PAGES)
+]
+
+
+class HelpView(discord.ui.View):
+    """Interactive paginator: Previous / Next buttons plus a jump-to-page dropdown."""
+
+    def __init__(self, author_id: int, page: int = 0):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.page = page
+        self.message: Optional[discord.Message] = None
+        self._sync()
+
+    def _sync(self) -> None:
+        """Update button states and the page counter to match the current page."""
+        last = len(HELP_PAGES) - 1
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= last
+        self.indicator.label = f"{self.page + 1}/{len(HELP_PAGES)}"
+
+    async def _show(self, interaction: discord.Interaction) -> None:
+        self._sync()
+        await interaction.response.edit_message(
+            embed=build_help_embed(self.page), view=self
         )
-        songs = _juicewrld_items(payload)
 
-        if not songs:
-            await ctx.send(
-                f"No Juice WRLD catalog results found for **{query[:100]}**."
-            )
-            return
-
-        embed = discord.Embed(
-            title=f"🔎 Juice WRLD Search: {query[:200]}",
-            color=discord.Color.from_rgb(123, 44, 191)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            f"Run `{PREFIX}help` or `/help` to open your own copy of the command list.",
+            ephemeral=True,
         )
+        return False
 
-        for song in songs[:5]:
-            if not isinstance(song, dict):
-                continue
-            name = _juicewrld_safe(song.get("name"), "Unknown title", 250)
-            category = _juicewrld_safe(
-                song.get("category"), "Uncategorized", 100
-            )
-            artists = _juicewrld_safe(
-                song.get("credited_artists"), "Juice WRLD", 200
-            )
-            details = f"Artist: {artists}\nCategory: {category}"
-            if song.get("id") is not None:
-                details += f"\nCatalog ID: `{song['id']}`"
-            if song.get("album"):
-                details += f"\nAlbum: {_juicewrld_safe(song['album'], limit=150)}"
-            embed.add_field(name=name, value=details[:1024], inline=False)
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
-        embed.set_footer(text="Catalog information from Juice WRLD API")
-        await ctx.send(embed=embed)
+    @discord.ui.button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        await self._show(interaction)
 
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
-        print(f"[JuiceWRLD] Song search failed: {exc}")
-        await ctx.send("The Juice WRLD API is unavailable right now. Try again later.")
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass  # Display-only page counter.
+
+    @discord.ui.button(label="Next", emoji="▶️", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(len(HELP_PAGES) - 1, self.page + 1)
+        await self._show(interaction)
+
+    @discord.ui.select(
+        placeholder="Jump to a page…",
+        options=_HELP_SELECT_OPTIONS,
+        min_values=1,
+        max_values=1,
+        row=1,
+    )
+    async def page_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.page = int(select.values[0])
+        await self._show(interaction)
 
 
-# ------------------------------------------------------------------
+async def send_help(ctx: commands.Context, topic: str = "") -> None:
+    view = HelpView(ctx.author.id, find_help_page(topic))
+    view.message = await ctx.send(embed=build_help_embed(view.page), view=view)
 
 
+# =============================================================================
+# 10. EVENTS & ERROR HANDLING
+# =============================================================================
 @bot.event
 async def on_ready():
     print(f"Bot is online as {bot.user}")
@@ -661,7 +1035,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing argument: `{error.param.name}`. Use `~help` to see examples.")
+        await ctx.send(f"Missing argument: `{error.param.name}`. Use `{PREFIX}help` to see examples.")
         return
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send("Please wait a moment before using that command again.")
@@ -673,7 +1047,25 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     await ctx.send("Something went wrong while running that command. Check the bot console.")
 
 
-# -------------------- Prefix music commands --------------------
+# =============================================================================
+# 11. PREFIX COMMANDS
+# =============================================================================
+
+# ---- Help ----
+
+@bot.command(name="help", aliases=["commands", "cmds", "h"])
+async def help_command(ctx: commands.Context, *, topic: str = ""):
+    """Open the multi-page command list. Optional topic, e.g. ~help music"""
+    await send_help(ctx, topic)
+
+
+@bot.command(name="musichelp", aliases=["mhelp"])
+async def musichelp_command(ctx: commands.Context):
+    """Open the command list on the music page."""
+    await send_help(ctx, "music")
+
+
+# ---- Music ----
 
 @bot.command(name="play", aliases=["p"])
 async def play_command(ctx: commands.Context, *, query: str = ""):
@@ -687,13 +1079,13 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         return await ctx.send(str(exc))
     diag("joined voice, continuing")
 
-    attachment =ctx.message.attachments[0] if ctx.message.attachments else None
+    attachment = ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment:
         suffix = Path(urlparse(attachment.filename).path).suffix.lower()
-        if suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}:
+        if suffix not in ALLOWED_UPLOAD_SUFFIXES:
             return await ctx.send("Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.")
-        if attachment.size > 20 * 1024 * 1024:
-            return await ctx.send("That file is over the bot's 20 MB safety limit.")
+        if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
+            return await ctx.send(f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.")
         if not query:
             query = attachment.filename
         try:
@@ -716,7 +1108,7 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
 
     if not query.strip():
         return await ctx.send(
-            "Usage: `~play song name or URL` — or attach an audio file to `~play`."
+            f"Usage: `{PREFIX}play song name or URL` — or attach an audio file to `{PREFIX}play`."
         )
 
     # Spotify and Apple Music links may provide metadata or a playable match,
@@ -751,7 +1143,7 @@ async def queue_command(ctx: commands.Context):
     guild_id = ctx.guild.id
     tracks = list(get_queue(guild_id))
     current = current_tracks.get(guild_id)
-    embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.from_rgb(28, 27, 32))
+    embed = discord.Embed(title="🎵 Music Queue", color=BRAND_COLOR)
     if current:
         embed.add_field(
             name="Now playing",
@@ -836,14 +1228,7 @@ async def nowplaying_command(ctx: commands.Context):
     track = current_tracks.get(ctx.guild.id) if ctx.guild else None
     if not track:
         return await ctx.send("Nothing is playing right now.")
-    embed = discord.Embed(
-        title="🎶 Now Playing",
-        description=f"[{discord.utils.escape_markdown(track.title)}]({track.webpage_url})",
-        color=discord.Color.from_rgb(28, 27, 32),
-    )
-    embed.add_field(name="Duration", value=format_duration(track.duration), inline=True)
-    embed.add_field(name="Requested by", value=track.requester, inline=True)
-    await ctx.send(embed=embed)
+    await ctx.send(embed=build_now_playing_embed(track))
 
 
 @bot.command(name="loop")
@@ -853,7 +1238,7 @@ async def loop_command(ctx: commands.Context, mode: str = "off"):
     mode = mode.lower()
     aliases = {"song": "song", "track": "song", "queue": "queue", "all": "queue", "off": "off", "none": "off"}
     if mode not in aliases:
-        return await ctx.send("Usage: `~loop song`, `~loop queue`, or `~loop off`.")
+        return await ctx.send(f"Usage: `{PREFIX}loop song`, `{PREFIX}loop queue`, or `{PREFIX}loop off`.")
     loop_modes[ctx.guild.id] = aliases[mode]
     await ctx.send(f"🔁 Loop mode set to **{aliases[mode]}**.")
 
@@ -873,27 +1258,71 @@ async def leave_command(ctx: commands.Context):
     await ctx.send("👋 Disconnected from voice.")
 
 
-@bot.command(name="musichelp", aliases=["mhelp"])
-async def musichelp_command(ctx: commands.Context):
-    embed = discord.Embed(title="VaultBot Music Commands", color=discord.Color.from_rgb(28, 27, 32))
-    embed.description = (
-        "`~play <song or URL>` — play/search and queue a song\n"
-        "`~play` with an audio attachment — play your uploaded file\n"
-        "`~queue` — show the queue\n"
-        "`~skip` — skip the current song\n"
-        "`~stop` — stop and clear the queue\n"
-        "`~pause` / `~resume` — pause or resume\n"
-        "`~volume 0-100` — set volume\n"
-        "`~nowplaying` — show current track\n"
-        "`~loop song|queue|off` — set loop mode\n"
-        "`~leave` — disconnect from voice\n"
-        "`~jwsong <search>` — search Juice WRLD catalog metadata\n"
-        "`~help` — show all bot commands"
-    )
-    await ctx.send(embed=embed)
+# ---- Juice WRLD ----
+
+@bot.command(name="jwsong")
+async def juicewrld_song_search(ctx: commands.Context, *, query: str):
+    """Search Juice WRLD catalog metadata. Usage: ~jwsong lucid dreams"""
+    try:
+        payload = await _juicewrld_api_get(
+            "/songs/",
+            params={"search": query, "page_size": 5}
+        )
+        songs = _juicewrld_items(payload)
+
+        if not songs:
+            await ctx.send(
+                f"No Juice WRLD catalog results found for **{query[:100]}**."
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"🔎 Juice WRLD Search: {query[:200]}",
+            color=JUICE_COLOR
+        )
+
+        for song in songs[:5]:
+            if not isinstance(song, dict):
+                continue
+            name = _juicewrld_safe(song.get("name"), "Unknown title", 250)
+            category = _juicewrld_safe(
+                song.get("category"), "Uncategorized", 100
+            )
+            artists = _juicewrld_safe(
+                song.get("credited_artists"), "Juice WRLD", 200
+            )
+            details = f"Artist: {artists}\nCategory: {category}"
+            if song.get("id") is not None:
+                details += f"\nCatalog ID: `{song['id']}`"
+            if song.get("album"):
+                details += f"\nAlbum: {_juicewrld_safe(song['album'], limit=150)}"
+            embed.add_field(name=name, value=details[:1024], inline=False)
+
+        embed.set_footer(text="Catalog information from Juice WRLD API")
+        await ctx.send(embed=embed)
+
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Song search failed: {exc}")
+        await ctx.send("The Juice WRLD API is unavailable right now. Try again later.")
 
 
-# -------------------- Existing slash commands: preserved --------------------
+# =============================================================================
+# 12. SLASH COMMANDS
+# =============================================================================
+
+@bot.tree.command(name="help", description="Browse everything VaultBot can do")
+@discord.app_commands.describe(page="Optional: jump straight to a section")
+@discord.app_commands.choices(
+    page=[
+        discord.app_commands.Choice(name=p["title"], value=p["key"])
+        for p in HELP_PAGES
+    ]
+)
+async def slash_help(interaction: discord.Interaction, page: Optional[str] = None):
+    view = HelpView(interaction.user.id, find_help_page(page))
+    await interaction.response.send_message(embed=build_help_embed(view.page), view=view)
+    view.message = await interaction.original_response()
+
 
 @bot.tree.command(name="ping", description="Check if the bot is online")
 async def ping(interaction: discord.Interaction):
@@ -980,7 +1409,7 @@ async def musicdrop(
     embed = discord.Embed(
         title=title,
         description=description,
-        color=discord.Color.from_rgb(28, 27, 32)
+        color=BRAND_COLOR
     )
     embed.set_thumbnail(url=artwork_url)
     embed.set_footer(text=artist)
@@ -1037,6 +1466,9 @@ async def announce(
         )
 
 
+# =============================================================================
+# 13. STARTUP
+# =============================================================================
 if not TOKEN:
     print("DISCORD_TOKEN detected:", bool(os.getenv("DISCORD_TOKEN")))
     raise RuntimeError(
