@@ -382,7 +382,7 @@ JUICEWRLD_POLL_MINUTES = max(
 )
 JUICEWRLD_STATE_FILE = Path(os.getenv(
     "JUICEWRLD_STATE_FILE",
-    "/home/container/juicewrld_seen.json"
+    str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
 ))
 
 _juicewrld_seen: set[str] = set()
