@@ -44,20 +44,35 @@ YTDL_OPTIONS = {
 FFMPEG_OPTIONS = {"options": "-vn"}
 
 # -------------------- YouTube cookies --------------------
-# Put your cookies in the host's environment variables as COOKIES_B64 (base64
-# of cookies.txt). The bot rebuilds the cookies file from it on every startup,
-# so the cookies never have to be committed to GitHub.
+# Put your cookies in the host's environment variables as base64 of cookies.txt.
+# The host limits each variable to 2000 characters, so the base64 text can be
+# split across COOKIES_B64_1, COOKIES_B64_2, COOKIES_B64_3, ... (in order).
+# A single COOKIES_B64 variable still works too. The bot rebuilds the cookies
+# file from these on every startup, so the cookies never have to be committed
+# to GitHub.
+def _read_cookies_b64() -> str:
+    parts = []
+    for i in range(1, 51):
+        part = os.getenv(f"COOKIES_B64_{i}")
+        if part is None:
+            break
+        parts.append("".join(part.split()))
+    if parts:
+        return "".join(parts)
+    return "".join((os.getenv("COOKIES_B64") or "").split())
+
+
 COOKIE_PATH = os.path.join(tempfile.gettempdir(), "vaultbot_cookies.txt")
-_cookies_b64 = os.getenv("COOKIES_B64")
+_cookies_b64 = _read_cookies_b64()
 if _cookies_b64:
     try:
-        Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64.strip()))
+        Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64))
         YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
         print(f"yt-dlp will use cookies from {COOKIE_PATH}")
     except Exception as exc:
-        print(f"Could not write cookies file from COOKIES_B64: {exc}")
+        print(f"Could not write cookies file from the COOKIES_B64 variables: {exc}")
 else:
-    print("WARNING: COOKIES_B64 is not set. YouTube may block this host's IP.")
+    print("WARNING: no COOKIES_B64_1 / COOKIES_B64 variable is set. YouTube may block this host's IP.")
 
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 
