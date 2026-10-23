@@ -44,24 +44,22 @@ YTDL_OPTIONS = {
 FFMPEG_OPTIONS = {"options": "-vn"}
 
 # -------------------- YouTube cookies --------------------
-# Option A: put your cookies in the host's .env as COOKIES_B64 (base64 of
-# cookies.txt). The bot rebuilds cookies.txt from it every startup, so the
-# cookies never have to be committed to GitHub.
-# Option B: upload cookies.txt to /home/container/ with the host's file manager.
-COOKIE_PATH = os.getenv("COOKIE_FILE", "/home/container/cookies.txt")
+# Put your cookies in the host's environment variables as COOKIES_B64 (base64
+# of cookies.txt). The bot rebuilds the cookies file from it on every startup,
+# so the cookies never have to be committed to GitHub.
+COOKIE_PATH = os.path.join(tempfile.gettempdir(), "vaultbot_cookies.txt")
 _cookies_b64 = os.getenv("COOKIES_B64")
 if _cookies_b64:
     try:
-        Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64))
-        print(f"Wrote YouTube cookies file from COOKIES_B64 to {COOKIE_PATH}")
+        Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64.strip()))
+        YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
+        print(f"yt-dlp will use cookies from {COOKIE_PATH}")
     except Exception as exc:
         print(f"Could not write cookies file from COOKIES_B64: {exc}")
-
-if Path(COOKIE_PATH).is_file():
-    YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
-    print(f"yt-dlp will use cookies from {COOKIE_PATH}")
 else:
-    print("WARNING: No YouTube cookies file found. YouTube may block this host's IP.")
+    print("WARNING: COOKIES_B64 is not set. YouTube may block this host's IP.")
+
+print(f"yt-dlp version: {yt_dlp.version.__version__}")
 
 
 # Per-server music state.
