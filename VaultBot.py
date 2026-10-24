@@ -6,7 +6,7 @@ File layout
  1. Imports
  2. Configuration & constants
  3. Bot setup
- 4. yt-dlp & YouTube cookies
+ 4. yt-dlp configuration
  5. Diagnostics (temporary)
  6. Music state, data types & helpers
  7. Music engine (extract / queue / playback)
@@ -29,7 +29,6 @@ load_dotenv("/home/container/.env")
 # 1. IMPORTS
 # =============================================================================
 import asyncio
-import base64
 import faulthandler
 import json
 import os
@@ -109,13 +108,13 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 
 # =============================================================================
-# 4. YT-DLP & YOUTUBE COOKIES
+# 4. YT-DLP CONFIGURATION
 # =============================================================================
 # yt-dlp settings. This resolves public, playable media sources; it does not
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
     # Prefer an audio-only format; avoid fetching video when audio is available.
-    "format": "bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best",
+    "format": "worstaudio[acodec!=none]/bestaudio[acodec!=none]/best[acodec!=none]/best",
     "noplaylist": True,
     "playlist_items": "1",
     "quiet": True,
@@ -127,43 +126,19 @@ YTDL_OPTIONS = {
     # Keep yt-dlp's disk cache off and prevent concurrent fragment buffering.
     "cachedir": False,
     "concurrent_fragment_downloads": 1,
-    "retries": 2,
-    "fragment_retries": 2,
-    "socket_timeout": 15,
+    "retries": 1,
+    "fragment_retries": 1,
+    "socket_timeout": 10,
+    # Do not start an external JavaScript runtime (such as Deno) for extraction.
+    # This reduces process/RAM overhead, but some YouTube requests may then fail
+    # if the site requires a JavaScript challenge to be solved.
+    "js_runtimes": {},
 }
 
 FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
 
 
-# Put your cookies in the host's environment variables as base64 of cookies.txt.
-# The host limits each variable to 2000 characters, so the base64 text can be
-# split across COOKIES_B64_1, COOKIES_B64_2, COOKIES_B64_3, ... (in order).
-# A single COOKIES_B64 variable still works too. The bot rebuilds the cookies
-# file from these on every startup, so the cookies never have to be committed
-# to GitHub.
-def _read_cookies_b64() -> str:
-    parts = []
-    for i in range(1, 51):
-        part = os.getenv(f"COOKIES_B64_{i}")
-        if part is None:
-            break
-        parts.append("".join(part.split()))
-    if parts:
-        return "".join(parts)
-    return "".join((os.getenv("COOKIES_B64") or "").split())
-
-
-COOKIE_PATH = os.path.join(tempfile.gettempdir(), "vaultbot_cookies.txt")
-_cookies_b64 = _read_cookies_b64()
-if _cookies_b64:
-    try:
-        Path(COOKIE_PATH).write_bytes(base64.b64decode(_cookies_b64))
-        YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
-        print(f"yt-dlp will use cookies from {COOKIE_PATH}")
-    except Exception as exc:
-        print(f"Could not write cookies file from the COOKIES_B64 variables: {exc}")
-else:
-    print("WARNING: no COOKIES_B64_1 / COOKIES_B64 variable is set. YouTube may block this host's IP.")
+# Cookies support was intentionally removed. YouTube may reject some requests without login cookies.
 
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 
@@ -915,7 +890,7 @@ HELP_PAGES: list[dict] = [
             (
                 "⚠️ If something goes wrong",
                 "**\"YouTube is blocking this bot\"** — the bot owner needs to "
-                "refresh the YouTube cookies and restart the bot.\n"
+                "try again later or use a public SoundCloud link instead.\n"
                 "**\"Couldn't play\"** — try the song again or use a different link.\n"
                 "**\"Missing argument\"** — check the usage shown for that "
                 "command on the earlier pages.",
@@ -1171,9 +1146,8 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         print(f"yt-dlp error: {error_text}", flush=True)
         if "confirm you" in error_text and "not a bot" in error_text:
             await ctx.send(
-                "⚠️ YouTube is blocking this bot's server. The YouTube cookies are "
-                "missing, expired, or not being accepted. The bot owner needs to "
-                "export fresh cookies (see the setup notes) and restart the bot."
+                "⚠️ YouTube is blocking this server or requires verification. "
+                "Try a public SoundCloud link or try again later."
             )
         else:
             await ctx.send(
