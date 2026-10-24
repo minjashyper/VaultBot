@@ -6,7 +6,7 @@ File layout
  1. Imports
  2. Configuration & constants
  3. Bot setup
- 4. yt-dlp configuration
+ 4. yt-dlp source configuration
  5. Diagnostics (temporary)
  6. Music state, data types & helpers
  7. Music engine (extract / queue / playback)
@@ -108,13 +108,13 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 
 # =============================================================================
-# 4. YT-DLP CONFIGURATION
+# 4. YT-DLP SOURCE CONFIGURATION (COOKIE-FREE)
 # =============================================================================
 # yt-dlp settings. This resolves public, playable media sources; it does not
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
     # Prefer an audio-only format; avoid fetching video when audio is available.
-    "format": "worstaudio[acodec!=none]/bestaudio[acodec!=none]/best[acodec!=none]/best",
+    "format": "bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best",
     "noplaylist": True,
     "playlist_items": "1",
     "quiet": True,
@@ -126,19 +126,24 @@ YTDL_OPTIONS = {
     # Keep yt-dlp's disk cache off and prevent concurrent fragment buffering.
     "cachedir": False,
     "concurrent_fragment_downloads": 1,
-    "retries": 1,
-    "fragment_retries": 1,
-    "socket_timeout": 10,
-    # Do not start an external JavaScript runtime (such as Deno) for extraction.
-    # This reduces process/RAM overhead, but some YouTube requests may then fail
-    # if the site requires a JavaScript challenge to be solved.
-    "js_runtimes": {},
+    "retries": 2,
+    "fragment_retries": 2,
+    "socket_timeout": 12,
+    # Try commonly available YouTube clients without requiring a cookie file.
+    # This is not a bypass for sign-in restrictions; YouTube may still deny
+    # access to some videos or hosting IPs. yt-dlp may need its JS runtime.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["web_safari", "tv"],
+        }
+    },
 }
 
 FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
 
 
-# Cookies support was intentionally removed. YouTube may reject some requests without login cookies.
+# This build intentionally does not read or create YouTube cookie files.
+# Public tracks may work without sign-in; YouTube can still restrict requests.
 
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
 
@@ -286,8 +291,8 @@ def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> di
 # =============================================================================
 # 7. MUSIC ENGINE
 # =============================================================================
-# Only one yt-dlp extraction/download runs at a time. This prevents two
-# simultaneous song requests from exceeding the host's 256 MB memory limit.
+# Only one yt-dlp extraction/download runs at a time to limit memory spikes
+# on small hosting plans.
 _YTDL_SEMAPHORE = asyncio.Semaphore(1)
 
 
@@ -889,8 +894,9 @@ HELP_PAGES: list[dict] = [
             ),
             (
                 "⚠️ If something goes wrong",
-                "**\"YouTube is blocking this bot\"** — the bot owner needs to "
-                "try again later or use a public SoundCloud link instead.\n"
+                "**\"YouTube is blocking this bot\"** — some videos or hosting IPs "
+                "require sign-in. This build tries alternate public clients, but "
+                "there is no guaranteed cookie-free fix. Try another public link.\n"
                 "**\"Couldn't play\"** — try the song again or use a different link.\n"
                 "**\"Missing argument\"** — check the usage shown for that "
                 "command on the earlier pages.",
@@ -1144,10 +1150,17 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     except Exception as exc:
         error_text = str(exc)
         print(f"yt-dlp error: {error_text}", flush=True)
-        if "confirm you" in error_text and "not a bot" in error_text:
+        lower_error = error_text.lower()
+        if (
+            ("confirm you" in lower_error and "not a bot" in lower_error)
+            or "sign in to confirm" in lower_error
+            or "login required" in lower_error
+        ):
             await ctx.send(
-                "⚠️ YouTube is blocking this server or requires verification. "
-                "Try a public SoundCloud link or try again later."
+                "⚠️ YouTube requires sign-in for this request. VaultBot is configured "
+                "to try alternate public YouTube clients without cookies, but YouTube "
+                "can still block particular tracks or this host. Try a different "
+                "public YouTube URL or a SoundCloud link."
             )
         else:
             await ctx.send(
@@ -1204,7 +1217,9 @@ async def stop_command(ctx: commands.Context):
     voice = ctx.guild.voice_client
     get_queue(ctx.guild.id).clear()
     loop_modes[ctx.guild.id] = "off"
-    current_tracks.pop(ctx.guild.id, None)
+    current = current_tracks.pop(ctx.guild.id, None)
+    if current:
+        clean_temp_file(current.local_path)
     if voice:
         if voice.is_playing() or voice.is_paused():
             voice.stop()
@@ -1273,7 +1288,9 @@ async def leave_command(ctx: commands.Context):
     voice = ctx.guild.voice_client
     get_queue(guild_id).clear()
     loop_modes[guild_id] = "off"
-    current_tracks.pop(guild_id, None)
+    current = current_tracks.pop(guild_id, None)
+    if current:
+        clean_temp_file(current.local_path)
     if voice.is_playing() or voice.is_paused():
         voice.stop()
     await voice.disconnect()
