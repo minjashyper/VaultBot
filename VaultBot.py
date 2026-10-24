@@ -129,15 +129,14 @@ YTDL_OPTIONS = {
     "retries": 2,
     "fragment_retries": 2,
     "socket_timeout": 12,
-    # Try commonly available YouTube clients without requiring a cookie file.
-    # This is not a bypass for sign-in restrictions; YouTube may still deny
-    # access to some videos or hosting IPs. yt-dlp may need its JS runtime.
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web_safari", "tv"],
-        }
-    },
 }
+
+# By default let yt-dlp pick its own YouTube clients (they are updated with every
+# yt-dlp release, so hard-coding a list tends to go stale). If you want to force
+# specific clients, set YT_PLAYER_CLIENTS on your host, e.g. "android_vr,web_embedded".
+_yt_clients = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
+if _yt_clients:
+    YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": _yt_clients}}
 
 FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
 
@@ -146,6 +145,8 @@ FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
 # Public tracks may work without sign-in; YouTube can still restrict requests.
 
 print(f"yt-dlp version: {yt_dlp.version.__version__}")
+_js_runtime = shutil.which("deno") or shutil.which("node") or shutil.which("bun")
+print(f"JS runtime for yt-dlp: {_js_runtime or 'NONE FOUND (YouTube extraction will be unreliable; install deno or node)'}")
 
 
 class YTDLLogger:
@@ -296,9 +297,43 @@ def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> di
 _YTDL_SEMAPHORE = asyncio.Semaphore(1)
 
 
+def _is_signin_error(text: str) -> bool:
+    lower = text.lower()
+    return (
+        ("confirm you" in lower and "not a bot" in lower)
+        or "sign in to confirm" in lower
+        or "login required" in lower
+    )
+
+
+async def _fallback_search_text(query: str) -> Optional[str]:
+    """Turn a blocked YouTube request into a plain-text song search."""
+    if not query.lower().startswith(("http://", "https://")):
+        return query  # it was already a title search
+    if "youtube.com" not in query and "youtu.be" not in query:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://www.youtube.com/oembed",
+                params={"url": query, "format": "json"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                info = await resp.json()
+        title = (info.get("title") or "").strip()
+        # Strip tags like (UNRELEASED) / [Official Video] that hurt matching.
+        import re
+        title = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title).strip(" -")
+        return title or None
+    except Exception:
+        return None
+
+
 async def extract_track(query: str, requester: str) -> Track:
     """Find and download one playable audio track with one yt-dlp extraction pass."""
-    def _extract():
+    def _extract(query: str):
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
         options = dict(YTDL_OPTIONS)
         options.update({
@@ -366,7 +401,22 @@ async def extract_track(query: str, requester: str) -> Track:
             raise
 
     async with _YTDL_SEMAPHORE:
-        data = await asyncio.to_thread(_extract)
+        try:
+            data = await asyncio.to_thread(_extract, query)
+        except Exception as exc:
+            if not _is_signin_error(str(exc)):
+                raise
+            # YouTube blocked this host. Look up the video's title through
+            # YouTube's public oEmbed endpoint (no sign-in needed) and try to
+            # find the same song on SoundCloud instead.
+            diag("yt-dlp: YouTube sign-in wall hit, trying SoundCloud fallback")
+            search_text = await _fallback_search_text(query)
+            if not search_text:
+                raise
+            try:
+                data = await asyncio.to_thread(_extract, f"scsearch1:{search_text}")
+            except Exception:
+                raise exc
 
     TEMP_FILES.add(data["path"])
     return Track(
