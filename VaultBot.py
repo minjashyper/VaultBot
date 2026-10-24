@@ -522,7 +522,7 @@ def _juicewrld_items(payload):
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("results", "items", "data", "events"):
+        for key in ("results", "items", "data", "events", "files", "entries", "children"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
@@ -803,7 +803,7 @@ HELP_PAGES: list[dict] = [
                 f"`{PREFIX}jwsong <search>`",
                 "Searches the Juice WRLD catalog, opens a detailed song embed, "
                 "lets you choose alternate or related matches from a dropdown, and "
-                "shows a download button only for explicitly authorized download URLs.\n"
+                "shows detailed metadata and lets you search the API file browser for matching audio files.\n"
                 f"Example: `{PREFIX}jwsong lucid dreams`",
             ),
             (
@@ -1398,27 +1398,191 @@ def _build_juicewrld_song_embed(song, query=""):
     return embed
 
 
-def _jw_authorized_download_url(song):
-    """Return only a source-explicit authorized download URL, never infer a file path.
+def _jw_file_path(item):
+    """Extract a path relative to the API's compilation root."""
+    if isinstance(item, str):
+        # A bare name is only useful if the API itself returned a relative path.
+        return item.strip() if "/" in item.strip() else None
+    if not isinstance(item, dict):
+        return None
+    for key in ("path", "file_path", "relative_path", "filepath", "key"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Some listings return `id` as the relative path.
+    value = item.get("id")
+    if isinstance(value, str) and "/" in value:
+        return value.strip()
+    return None
 
-    The community catalog may list unreleased or otherwise unauthorized audio.
-    A generic `download_url` or a generated /files/download/ URL is not enough
-    to establish permission, so only clearly marked official/licensed fields
-    are eligible for a direct-download button.
-    """
-    if not any(song.get(flag) is True for flag in (
-        "download_authorized", "is_official_download", "licensed_download"
-    )):
-        return None
-    url = (song.get("authorized_download_url")
-           or song.get("official_download_url")
-           or song.get("licensed_download_url"))
-    if not isinstance(url, str) or not url.startswith("https://"):
-        return None
-    parsed = urlparse(url)
-    if not parsed.hostname or parsed.username or parsed.password:
-        return None
-    return url
+
+def _jw_file_is_directory(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("is_directory") is True or item.get("is_dir") is True or item.get("directory") is True:
+        return True
+    return str(item.get("type", "")).casefold() in {"directory", "dir", "folder"}
+
+
+def _jw_audio_candidates(items, query, limit=25):
+    """Filter API file-list entries to likely matching audio files."""
+    suffixes = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+    q = "".join(ch.casefold() for ch in query if ch.isalnum())
+    matches = []
+    seen = set()
+    for item in items:
+        if _jw_file_is_directory(item):
+            continue
+        path = _jw_file_path(item)
+        if not path or Path(path).suffix.casefold() not in suffixes:
+            continue
+        normalized = "".join(ch.casefold() for ch in Path(path).stem if ch.isalnum())
+        if q and q not in normalized and normalized not in q:
+            # Also allow one meaningful word to match if title variants differ.
+            words = ["".join(ch.casefold() for ch in w if ch.isalnum())
+                     for w in query.split()]
+            words = [w for w in words if len(w) >= 4]
+            if not words or not any(w in normalized for w in words):
+                continue
+        if path in seen:
+            continue
+        seen.add(path)
+        # Exact/close filename matches first.
+        score = 0 if q == normalized else (1 if q in normalized else 2)
+        matches.append((score, path, item))
+    matches.sort(key=lambda row: (row[0], row[1].casefold()))
+    return [(path, item) for _, path, item in matches[:limit]]
+
+
+def _jw_download_url(path, compressed=True):
+    """Build a URL to the API's documented file endpoint for an API-listed path."""
+    from urllib.parse import quote
+    endpoint = "files/download-compressed/" if compressed else "files/download/"
+    params = {"path": path}
+    if compressed:
+        params["bitrate"] = "160k"
+    return f"{JUICEWRLD_API_BASE}/{endpoint}?{urlencode(params)}"
+
+
+class JuiceWRLDFileSelect(discord.ui.Select):
+    def __init__(self, files, owner_id, song_title):
+        self.files = files
+        self.owner_id = owner_id
+        self.song_title = song_title
+        options = []
+        for index, (path, item) in enumerate(files[:25]):
+            filename = Path(path).name
+            size = item.get("size") if isinstance(item, dict) else None
+            description = str(size) + " bytes" if isinstance(size, (int, float)) else str(Path(path).parent)
+            options.append(discord.SelectOption(
+                label=filename[:100] or f"Audio file {index + 1}",
+                value=str(index),
+                description=description[:100] or "Audio file"
+            ))
+        super().__init__(
+            placeholder="Choose the matching audio file…",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who requested the search can choose a file.",
+                ephemeral=True
+            )
+            return
+        try:
+            index = int(self.values[0])
+            path, metadata = self.files[index]
+            size = metadata.get("size") if isinstance(metadata, dict) else None
+            embed = discord.Embed(
+                title="⬇️ Audio download",
+                description=(f"**Song:** {discord.utils.escape_markdown(self.song_title[:200])}\n"
+                            f"**File:** `{Path(path).name[:200]}`\n"
+                            f"**Path:** `{path[:800]}`\n\n"
+                            "Use the button below to download the selected file from the API."),
+                color=JUICE_COLOR
+            )
+            if isinstance(size, (int, float)):
+                embed.add_field(name="File size", value=f"{size / (1024 * 1024):.2f} MB", inline=True)
+            view = discord.ui.View(timeout=180)
+            view.add_item(discord.ui.Button(
+                label="Download MP3",
+                style=discord.ButtonStyle.link,
+                url=_jw_download_url(path, compressed=True),
+                emoji="⬇️"
+            ))
+            view.add_item(discord.ui.Button(
+                label="Original audio file",
+                style=discord.ButtonStyle.link,
+                url=_jw_download_url(path, compressed=False),
+                emoji="🎧"
+            ))
+            await interaction.response.edit_message(embed=embed, view=view)
+        except (IndexError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] Invalid file selection: {exc}")
+            await interaction.response.send_message(
+                "That file selection was invalid. Run the song search again.",
+                ephemeral=True
+            )
+
+
+class JuiceWRLDFindFilesButton(discord.ui.Button):
+    def __init__(self, owner_id, song):
+        super().__init__(
+            label="Find downloadable files",
+            style=discord.ButtonStyle.primary,
+            emoji="🔎"
+        )
+        self.owner_id = owner_id
+        self.song = song
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran the search can find files for this song.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        title = _juicewrld_safe(self.song.get("name"), "Juice WRLD song", 200)
+        try:
+            # Search the API's actual file browser; song metadata alone doesn't
+            # guarantee that a file path exists for the catalog entry.
+            payload = await _juicewrld_api_get("/files/browse/", params={"search": title})
+            entries = _juicewrld_items(payload)
+            matches = _jw_audio_candidates(entries, title)
+
+            # Some API deployments provide search only on browse, while others
+            # return a directory summary. Fall back to the flat file list.
+            if not matches:
+                payload = await _juicewrld_api_get("/files/list-all/")
+                entries = _juicewrld_items(payload)
+                matches = _jw_audio_candidates(entries, title)
+
+            if not matches:
+                await interaction.followup.send(
+                    f"I couldn't find an audio file matching **{title}** in the API file listing. "
+                    "The catalog entry may not have an associated file, or the file browser may use a different path format.",
+                    ephemeral=True
+                )
+                return
+
+            view = discord.ui.View(timeout=180)
+            view.add_item(JuiceWRLDFileSelect(matches, self.owner_id, title))
+            await interaction.followup.send(
+                content=f"Found **{len(matches)}** matching audio file(s) for **{title}**. Choose the exact file:",
+                view=view,
+                ephemeral=True
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] File search failed: {exc}")
+            await interaction.followup.send(
+                "The Juice WRLD file browser couldn't be reached. Try again later.",
+                ephemeral=True
+            )
 
 
 class JuiceWRLDSongSelect(discord.ui.Select):
@@ -1501,21 +1665,8 @@ class JuiceWRLDSongView(discord.ui.View):
         if select.options:
             self.add_item(select)
 
-        download_url = _jw_authorized_download_url(selected_song or {})
-        if download_url:
-            self.add_item(discord.ui.Button(
-                label="Download authorized audio",
-                style=discord.ButtonStyle.link,
-                url=download_url,
-                emoji="⬇️"
-            ))
-        else:
-            self.add_item(discord.ui.Button(
-                label="No authorized download link",
-                style=discord.ButtonStyle.secondary,
-                disabled=True,
-                emoji="🔒"
-            ))
+        if selected_song:
+            self.add_item(JuiceWRLDFindFilesButton(owner_id, selected_song))
 
     async def on_timeout(self):
         for item in self.children:
