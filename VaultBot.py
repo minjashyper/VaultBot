@@ -114,16 +114,25 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # yt-dlp settings. This resolves public, playable media sources; it does not
 # bypass paid services, DRM, private content, or service licensing restrictions.
 YTDL_OPTIONS = {
-    "format": "bestaudio/best",
+    # Prefer an audio-only format; avoid fetching video when audio is available.
+    "format": "bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best",
     "noplaylist": True,
+    "playlist_items": "1",
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
-    "skip_download": True,
+    "skip_download": False,
+    # Keep yt-dlp's disk cache off and prevent concurrent fragment buffering.
+    "cachedir": False,
+    "concurrent_fragment_downloads": 1,
+    "retries": 2,
+    "fragment_retries": 2,
+    "socket_timeout": 15,
 }
-FFMPEG_OPTIONS = {"options": "-vn"}
+
+FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
 
 
 # Put your cookies in the host's environment variables as base64 of cookies.txt.
@@ -302,55 +311,83 @@ def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> di
 # =============================================================================
 # 7. MUSIC ENGINE
 # =============================================================================
+# Only one yt-dlp extraction/download runs at a time. This prevents two
+# simultaneous song requests from exceeding the host's 256 MB memory limit.
+_YTDL_SEMAPHORE = asyncio.Semaphore(1)
+
+
 async def extract_track(query: str, requester: str) -> Track:
-    """Resolve and download a playable track so live YouTube URLs cannot expire mid-song."""
+    """Find and download one playable audio track with one yt-dlp extraction pass."""
     def _extract():
-        # Download each track to its own directory. Playing a local file avoids
-        # the short-lived googlevideo stream URL being reset during playback.
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
         options = dict(YTDL_OPTIONS)
         options.update({
             "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "skip_download": False,
-            "quiet": True,
-            "no_warnings": False,
             "logger": YTDLLogger(),
+            "noplaylist": True,
+            "playlist_items": "1",
+            "skip_download": False,
         })
+
         try:
-            diag("extract: looking up the video")
+            diag("yt-dlp: starting one-pass search/extraction/download")
+            # Passing download=True here lets yt-dlp resolve the search and
+            # download the selected result without a second extract_info call.
             with yt_dlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(query, download=False)
-                diag("extract: lookup finished, starting download")
-                if "entries" in info:
-                    info = next((entry for entry in info["entries"] if entry), None)
-                if not info:
-                    raise ValueError("No playable result was found.")
-                webpage_url = info.get("webpage_url") or info.get("original_url") or query
-                # Download the selected item rather than retaining an expiring stream URL.
-                downloaded = ydl.extract_info(webpage_url, download=True)
-                diag("extract: download finished")
-                requested = (downloaded or {}).get("requested_downloads") or []
-                path = requested[0].get("filepath") if requested else None
-                if not path or not Path(path).is_file():
-                    path = ydl.prepare_filename(downloaded or info)
-                if not Path(path).is_file():
-                    candidates = [p for p in Path(folder).iterdir() if p.is_file()]
-                    if not candidates:
-                        raise ValueError("yt-dlp did not produce an audio file.")
-                    path = str(candidates[0])
-                return {
-                    "title": (downloaded or info).get("title") or info.get("title") or "Unknown title",
-                    "webpage_url": webpage_url,
-                    "path": str(path),
-                    "duration": (downloaded or info).get("duration") or info.get("duration"),
-                    "extractor": info.get("extractor_key") or info.get("extractor") or "audio",
-                }
+                info = ydl.extract_info(query, download=True)
+
+            if not info:
+                raise ValueError("No playable result was found.")
+
+            # Be defensive if a site returns a playlist-shaped result anyway.
+            if isinstance(info, dict) and info.get("entries"):
+                entries = info.get("entries") or []
+                info = next((entry for entry in entries if entry), None)
+            if not isinstance(info, dict):
+                raise ValueError("yt-dlp did not return a playable track.")
+
+            webpage_url = (
+                info.get("webpage_url")
+                or info.get("original_url")
+                or query
+            )
+
+            # Prefer the actual filepath yt-dlp reports. Some extractors report
+            # requested_downloads; others report _filename or prepare_filename.
+            requested = info.get("requested_downloads") or []
+            path = requested[0].get("filepath") if requested and isinstance(requested[0], dict) else None
+            if not path:
+                path = info.get("_filename")
+            if not path:
+                try:
+                    path = ydl.prepare_filename(info)
+                except Exception:
+                    path = None
+
+            if not path or not Path(path).is_file():
+                candidates = [
+                    candidate for candidate in Path(folder).iterdir()
+                    if candidate.is_file() and not candidate.name.endswith((".part", ".ytdl"))
+                ]
+                if not candidates:
+                    raise ValueError("yt-dlp did not produce an audio file.")
+                path = str(candidates[0])
+
+            diag("yt-dlp: download finished")
+            return {
+                "title": info.get("title") or "Unknown title",
+                "webpage_url": webpage_url,
+                "path": str(path),
+                "duration": info.get("duration"),
+                "extractor": info.get("extractor_key") or info.get("extractor") or "audio",
+            }
         except Exception:
             shutil.rmtree(folder, ignore_errors=True)
             raise
 
-    data = await asyncio.to_thread(_extract)
+    async with _YTDL_SEMAPHORE:
+        data = await asyncio.to_thread(_extract)
+
     TEMP_FILES.add(data["path"])
     return Track(
         title=data["title"],
