@@ -1467,6 +1467,170 @@ async def announce(
 
 
 # =============================================================================
+# VAULTBOT AI (embedded in this file; no ai_module.py required)
+# =============================================================================
+import asyncio
+import os
+from collections import defaultdict
+from typing import DefaultDict
+
+import discord
+from discord.ext import commands
+from openai import APIError, AsyncOpenAI
+
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
+SYSTEM_PROMPT = os.getenv(
+    "OPENAI_SYSTEM_PROMPT",
+    "You are VaultBot AI, a helpful, friendly assistant inside Discord. "
+    "Be clear and concise, use Discord-friendly Markdown, and never claim you "
+    "performed an action unless a tool actually performed it. You cannot access "
+    "server data or execute commands unless the bot explicitly provides that ability.",
+)
+MAX_HISTORY_MESSAGES = 12  # 6 user/assistant exchanges per server and user
+MAX_PROMPT_LENGTH = 4000
+MAX_DISCORD_MESSAGE_LENGTH = 1900
+
+_api_key = os.getenv("OPENAI_API_KEY")
+_client = AsyncOpenAI(api_key=_api_key) if _api_key else None
+
+# Short-lived in-memory conversation context. This resets when the bot restarts.
+_conversations: DefaultDict[tuple[int, int], list[dict[str, str]]] = defaultdict(list)
+_api_semaphore = asyncio.Semaphore(3)
+
+
+def _conversation_key(guild_id: int | None, user_id: int) -> tuple[int, int]:
+    return (guild_id or 0, user_id)
+
+
+def _split_message(text: str, limit: int = MAX_DISCORD_MESSAGE_LENGTH) -> list[str]:
+    """Split long model output into Discord-safe message chunks."""
+    text = text.strip() or "I didn't receive a text response. Please try again."
+    chunks = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = text.rfind(" ", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+async def _ask_ai(guild_id: int | None, user_id: int, prompt: str) -> str:
+    if _client is None:
+        raise RuntimeError(
+            "AI isn't configured yet. Add OPENAI_API_KEY to your host's environment variables, then restart VaultBot."
+        )
+
+    key = _conversation_key(guild_id, user_id)
+    previous = _conversations[key]
+    new_history = [*previous, {"role": "user", "content": prompt}]
+
+    async with _api_semaphore:
+        response = await _client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM_PROMPT,
+            input=new_history,
+            max_output_tokens=700,
+        )
+
+    answer = (response.output_text or "").strip()
+    if not answer:
+        answer = "I couldn't generate a response this time. Please try again."
+
+    # Save only successful exchanges and keep a small rolling context window.
+    _conversations[key] = (
+        new_history + [{"role": "assistant", "content": answer}]
+    )[-MAX_HISTORY_MESSAGES:]
+    return answer
+
+
+def register_ai_commands(bot: commands.Bot) -> None:
+    """Register the prefix and slash AI commands on the existing bot."""
+
+    @bot.command(name="ai", aliases=["askai"])
+    @commands.cooldown(1, 8.0, commands.BucketType.user)
+    async def ai_prefix(ctx: commands.Context, *, prompt: str = "") -> None:
+        """Ask VaultBot AI. Example: ~ai give me ideas for my server"""
+        if not prompt.strip():
+            await ctx.send("Usage: `~ai <your question>`")
+            return
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            await ctx.send(f"Please keep your question under {MAX_PROMPT_LENGTH} characters.")
+            return
+
+        async with ctx.typing():
+            try:
+                answer = await _ask_ai(ctx.guild.id if ctx.guild else None, ctx.author.id, prompt.strip())
+            except RuntimeError as exc:
+                await ctx.send(str(exc))
+                return
+            except APIError as exc:
+                print(f"[VaultBot AI] OpenAI API request failed: {exc}")
+                await ctx.send("The AI service couldn't respond right now. Please try again shortly.")
+                return
+            except Exception as exc:
+                print(f"[VaultBot AI] Unexpected error: {exc}")
+                await ctx.send("Something went wrong while contacting the AI service.")
+                return
+
+        for chunk in _split_message(answer):
+            await ctx.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+    @bot.tree.command(name="ask", description="Ask VaultBot AI a question")
+    @discord.app_commands.describe(prompt="What would you like to ask VaultBot AI?")
+    @discord.app_commands.checks.cooldown(1, 8.0, key=lambda interaction: interaction.user.id)
+    async def ai_slash(interaction: discord.Interaction, prompt: str) -> None:
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            await interaction.response.send_message(
+                f"Please keep your question under {MAX_PROMPT_LENGTH} characters.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        try:
+            answer = await _ask_ai(
+                interaction.guild_id,
+                interaction.user.id,
+                prompt.strip(),
+            )
+        except RuntimeError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        except APIError as exc:
+            print(f"[VaultBot AI] OpenAI API request failed: {exc}")
+            await interaction.followup.send(
+                "The AI service couldn't respond right now. Please try again shortly.",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            print(f"[VaultBot AI] Unexpected error: {exc}")
+            await interaction.followup.send(
+                "Something went wrong while contacting the AI service.",
+                ephemeral=True,
+            )
+            return
+
+        chunks = _split_message(answer)
+        await interaction.followup.send(
+            chunks[0], allowed_mentions=discord.AllowedMentions.none()
+        )
+        for chunk in chunks[1:]:
+            await interaction.followup.send(
+                chunk, allowed_mentions=discord.AllowedMentions.none()
+            )
+
+
+# Register AI commands on the existing bot.
+register_ai_commands(bot)
+
+
+# =============================================================================
 # 13. STARTUP
 # =============================================================================
 if not TOKEN:
