@@ -306,12 +306,53 @@ def _is_signin_error(text: str) -> bool:
     )
 
 
-async def _fallback_search_text(query: str) -> Optional[str]:
-    """Turn a blocked YouTube request into a plain-text song search."""
-    if not query.lower().startswith(("http://", "https://")):
-        return query  # it was already a title search
-    if "youtube.com" not in query and "youtu.be" not in query:
+def _norm_tokens(text: str) -> set:
+    import re
+    return {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 1}
+
+
+def _soundcloud_pick(search_text: str) -> Optional[str]:
+    """Search SoundCloud and return the URL of the best-matching result, or None."""
+    wanted = _norm_tokens(search_text)
+    if not wanted:
         return None
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "cachedir": False,
+        "socket_timeout": 12,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"scsearch8:{search_text}", download=False)
+    except Exception as exc:
+        print(f"[fallback] SoundCloud search error: {exc}", flush=True)
+        return None
+    best_url, best_score = None, 0.0
+    for entry in (info or {}).get("entries") or []:
+        if not entry:
+            continue
+        url = entry.get("url") or entry.get("webpage_url")
+        got = _norm_tokens(f"{entry.get('title') or ''} {entry.get('uploader') or ''}")
+        if not url or not got:
+            continue
+        score = len(wanted & got) / len(wanted)
+        if score > best_score:
+            best_url, best_score = url, score
+    # Require most of the words to match so we never play a random wrong song.
+    return best_url if best_score >= 0.6 else None
+
+
+async def _fallback_search_variants(query: str) -> list:
+    """Turn a blocked YouTube request into a few plain-text song searches."""
+    import re
+    if not query.lower().startswith(("http://", "https://")):
+        return [query]  # it was already a title search
+    if "youtube.com" not in query and "youtu.be" not in query:
+        return []
+    title = ""
     try:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -319,16 +360,30 @@ async def _fallback_search_text(query: str) -> Optional[str]:
                 "https://www.youtube.com/oembed",
                 params={"url": query, "format": "json"},
             ) as resp:
-                if resp.status != 200:
-                    return None
-                info = await resp.json()
-        title = (info.get("title") or "").strip()
-        # Strip tags like (UNRELEASED) / [Official Video] that hurt matching.
-        import re
-        title = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", title).strip(" -")
-        return title or None
-    except Exception:
-        return None
+                if resp.status == 200:
+                    title = ((await resp.json()).get("title") or "").strip()
+    except Exception as exc:
+        print(f"[fallback] oEmbed lookup failed: {exc}", flush=True)
+    if not title:
+        return []
+
+    # Strip tags like (UNRELEASED) / [Official Video] that hurt matching.
+    cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    variants = [cleaned]
+    # "Song A/Song B" or "Artist - Song A / Song B": also try just the first song.
+    if "/" in cleaned:
+        first = cleaned.split("/")[0].strip(" -")
+        if first:
+            variants.append(first)
+    # Last resort: the raw title.
+    variants.append(re.sub(r"\s+", " ", title))
+    seen, out = set(), []
+    for v in variants:
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+    return out
 
 
 async def extract_track(query: str, requester: str) -> Track:
@@ -410,12 +465,20 @@ async def extract_track(query: str, requester: str) -> Track:
             # YouTube's public oEmbed endpoint (no sign-in needed) and try to
             # find the same song on SoundCloud instead.
             diag("yt-dlp: YouTube sign-in wall hit, trying SoundCloud fallback")
-            search_text = await _fallback_search_text(query)
-            if not search_text:
-                raise
-            try:
-                data = await asyncio.to_thread(_extract, f"scsearch1:{search_text}")
-            except Exception:
+            variants = await _fallback_search_variants(query)
+            print(f"[fallback] search variants: {variants}", flush=True)
+            data = None
+            for text in variants:
+                sc_url = await asyncio.to_thread(_soundcloud_pick, text)
+                print(f"[fallback] {text!r} -> {sc_url}", flush=True)
+                if not sc_url:
+                    continue
+                try:
+                    data = await asyncio.to_thread(_extract, sc_url)
+                    break
+                except Exception as sc_exc:
+                    print(f"[fallback] SoundCloud download failed: {sc_exc}", flush=True)
+            if data is None:
                 raise exc
 
     TEMP_FILES.add(data["path"])
