@@ -20,6 +20,9 @@ File layout
 
 from dotenv import load_dotenv
 
+# Support both project-local .env files and hosts that use /home/container/.env.
+# Existing host environment variables take precedence over values from these files.
+load_dotenv()
 load_dotenv("/home/container/.env")
 
 # =============================================================================
@@ -75,9 +78,16 @@ JUICEWRLD_API_BASE = os.getenv(
 ).rstrip("/")
 JUICEWRLD_API_KEY = os.getenv("JUICEWRLD_API_KEY")
 JUICEWRLD_CHANNEL_ID = os.getenv("JUICEWRLD_CHANNEL_ID")
-JUICEWRLD_POLL_MINUTES = max(
-    1, int(os.getenv("JUICEWRLD_POLL_MINUTES", "5"))
-)
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer environment variable without crashing startup."""
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        print(f"WARNING: {name} must be a positive integer; using {default}.")
+        return default
+
+
+JUICEWRLD_POLL_MINUTES = _positive_int_env("JUICEWRLD_POLL_MINUTES", 5)
 JUICEWRLD_STATE_FILE = Path(os.getenv(
     "JUICEWRLD_STATE_FILE",
     str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
@@ -1520,6 +1530,7 @@ async def _groq_chat_reply(user_id: int, conversation_id: int, prompt: str) -> s
                 async with session.post(GROQ_API_URL, headers=headers, json=payload) as response:
                     body = await response.json(content_type=None)
                     if response.status == 401:
+                        history.pop()
                         raise RuntimeError("Groq rejected the API key. Check GROQ_API_KEY.")
                     if response.status == 429:
                         # Remove the unanswered prompt so history remains consistent.
@@ -1618,59 +1629,118 @@ async def ask_ai_slash(interaction: discord.Interaction, question: str):
 @bot.command(name="clear")
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
-async def clear_messages(ctx, amount: int = 100):
-    """Clear 1–100 messages. Defaults to 100."""
+async def clear_messages(ctx: commands.Context, amount: int = 100):
+    """Clear 1–100 recent messages. Defaults to 100, plus the command message."""
 
     if not 1 <= amount <= 100:
         await ctx.send(
             "❌ Please choose a number between 1 and 100.",
-            delete_after=5
+            delete_after=5,
+        )
+        return
+
+    # Check the bot's effective permissions in this exact channel. Server role
+    # permissions can be overridden by channel-specific permission settings.
+    bot_member = ctx.guild.me
+    if bot_member is None:
+        print("[CLEAR] Could not resolve the bot's guild member.")
+        await ctx.send(
+            "❌ I couldn't check my server permissions. Please try again.",
+            delete_after=5,
+        )
+        return
+
+    permissions = ctx.channel.permissions_for(bot_member)
+    missing = []
+    if not permissions.manage_messages:
+        missing.append("Manage Messages")
+    if not permissions.read_message_history:
+        missing.append("Read Message History")
+
+    if missing:
+        missing_text = " and ".join(missing)
+        print(
+            f"[CLEAR] Missing effective permission(s) in channel "
+            f"{ctx.channel.id}: {missing_text}"
+        )
+        await ctx.send(
+            f"❌ I need **{missing_text}** permission(s) in this channel "
+            "to clear messages. Check the channel's permission overrides.",
+            delete_after=8,
         )
         return
 
     try:
-        # Include the command message in the cleanup.
+        # Fetch enough messages to include the requested number plus ~clear.
         deleted = await ctx.channel.purge(limit=amount + 1)
+        count = sum(message.id != ctx.message.id for message in deleted)
 
-        # Don't count the ~clear command itself.
-        count = max(0, len(deleted) - 1)
-
-        confirmation = await ctx.send(
+        print(
+            f"[CLEAR] User={ctx.author.id}, channel={ctx.channel.id}, "
+            f"requested={amount}, deleted_other_messages={count}"
+        )
+        await ctx.send(
             f"✅ Cleared **{count}** message(s)!",
-            delete_after=5
+            delete_after=5,
         )
 
-    except discord.Forbidden:
-        await ctx.send(
-            "❌ I need the **Manage Messages** permission "
-            "to clear messages.",
-            delete_after=5
+    except discord.Forbidden as exc:
+        # This should be uncommon after the permission check; log the details
+        # because Discord can still reject an operation for other reasons.
+        print(
+            f"[CLEAR] Discord returned Forbidden in channel {ctx.channel.id}. "
+            f"manage_messages={permissions.manage_messages}, "
+            f"read_message_history={permissions.read_message_history}, "
+            f"error={exc}"
         )
-    except discord.HTTPException:
-        await ctx.send(
-            "❌ Discord couldn't clear the messages. "
-            "Some messages may be too old.",
-            delete_after=5
+        try:
+            await ctx.send(
+                "❌ Discord denied the deletion. Recheck this channel's "
+                "permissions for the bot and its role.",
+                delete_after=8,
+            )
+        except discord.HTTPException:
+            pass
+
+    except discord.HTTPException as exc:
+        print(
+            f"[CLEAR] Discord HTTP error in channel {ctx.channel.id}: "
+            f"status={getattr(exc, 'status', 'unknown')}, error={exc}"
         )
+        try:
+            await ctx.send(
+                "❌ Discord couldn't complete the cleanup. Check the bot "
+                "console for the `[CLEAR]` error details.",
+                delete_after=8,
+            )
+        except discord.HTTPException:
+            pass
 
 
 @clear_messages.error
-async def clear_messages_error(ctx, error):
+async def clear_messages_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(
-            "❌ You need the **Manage Messages** permission "
-            "to use this command.",
-            delete_after=5
+            "❌ You need the **Manage Messages** permission to use this command.",
+            delete_after=5,
         )
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(
             "Usage: `~clear` or `~clear 1-100`",
-            delete_after=5
+            delete_after=5,
         )
     elif isinstance(error, commands.BadArgument):
         await ctx.send(
             "❌ Please enter a whole number from 1 to 100.",
-            delete_after=5
+            delete_after=5,
+        )
+    elif isinstance(error, commands.NoPrivateMessage):
+        await ctx.send("❌ Use this command inside a server.", delete_after=5)
+    else:
+        print(f"[CLEAR] Command setup error: {type(error).__name__}: {error}")
+        await ctx.send(
+            "❌ The clear command couldn't run. Check the bot console for details.",
+            delete_after=5,
         )
 
 
