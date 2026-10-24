@@ -1466,168 +1466,154 @@ async def announce(
         )
 
 
-# =============================================================================
-# VAULTBOT AI (embedded in this file; no ai_module.py required)
-# =============================================================================
-import asyncio
-import os
-from collections import defaultdict
-from typing import DefaultDict
 
-import discord
-from discord.ext import commands
-from openai import APIError, AsyncOpenAI
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
-SYSTEM_PROMPT = os.getenv(
-    "OPENAI_SYSTEM_PROMPT",
-    "You are VaultBot AI, a helpful, friendly assistant inside Discord. "
-    "Be clear and concise, use Discord-friendly Markdown, and never claim you "
-    "performed an action unless a tool actually performed it. You cannot access "
-    "server data or execute commands unless the bot explicitly provides that ability.",
+# =============================================================================
+# AI CHAT (Groq free tier; no OpenAI package required)
+# =============================================================================
+# Free API access is rate-limited, not unlimited. Set GROQ_API_KEY in the
+# host's environment variables or in /home/container/.env.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+AI_SYSTEM_PROMPT = os.getenv(
+    "AI_SYSTEM_PROMPT",
+    "You are VaultBot, a helpful, friendly AI assistant in a Discord server. "
+    "Be clear and concise. Follow safety rules and do not claim to have abilities "
+    "you do not have."
 )
-MAX_HISTORY_MESSAGES = 12  # 6 user/assistant exchanges per server and user
-MAX_PROMPT_LENGTH = 4000
-MAX_DISCORD_MESSAGE_LENGTH = 1900
-
-_api_key = os.getenv("OPENAI_API_KEY")
-_client = AsyncOpenAI(api_key=_api_key) if _api_key else None
-
-# Short-lived in-memory conversation context. This resets when the bot restarts.
-_conversations: DefaultDict[tuple[int, int], list[dict[str, str]]] = defaultdict(list)
-_api_semaphore = asyncio.Semaphore(3)
+AI_HISTORY_LIMIT = 12  # Maximum saved messages per conversation (6 exchanges)
+_ai_history: dict[tuple[int, int], list[dict[str, str]]] = {}
+_ai_http_semaphore = asyncio.Semaphore(3)
 
 
-def _conversation_key(guild_id: int | None, user_id: int) -> tuple[int, int]:
-    return (guild_id or 0, user_id)
-
-
-def _split_message(text: str, limit: int = MAX_DISCORD_MESSAGE_LENGTH) -> list[str]:
-    """Split long model output into Discord-safe message chunks."""
-    text = text.strip() or "I didn't receive a text response. Please try again."
-    chunks = []
-    while len(text) > limit:
-        split_at = text.rfind("\n", 0, limit)
-        if split_at < limit // 2:
-            split_at = text.rfind(" ", 0, limit)
-        if split_at < limit // 2:
-            split_at = limit
-        chunks.append(text[:split_at].strip())
-        text = text[split_at:].strip()
-    if text:
-        chunks.append(text)
-    return chunks
-
-
-async def _ask_ai(guild_id: int | None, user_id: int, prompt: str) -> str:
-    if _client is None:
+async def _groq_chat_reply(user_id: int, conversation_id: int, prompt: str) -> str:
+    """Ask Groq's OpenAI-compatible chat-completions API."""
+    if not GROQ_API_KEY:
         raise RuntimeError(
-            "AI isn't configured yet. Add OPENAI_API_KEY to your host's environment variables, then restart VaultBot."
+            "AI isn't configured yet. Add GROQ_API_KEY to your host environment "
+            "variables (or /home/container/.env), then restart VaultBot."
         )
 
-    key = _conversation_key(guild_id, user_id)
-    previous = _conversations[key]
-    new_history = [*previous, {"role": "user", "content": prompt}]
+    key = (conversation_id, user_id)
+    history = _ai_history.setdefault(key, [])
+    history.append({"role": "user", "content": prompt})
+    # Keep the prompt bounded and only send a small recent conversation.
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    messages.extend(history[-AI_HISTORY_LIMIT:])
 
-    async with _api_semaphore:
-        response = await _client.responses.create(
-            model=MODEL,
-            instructions=SYSTEM_PROMPT,
-            input=new_history,
-            max_output_tokens=700,
-        )
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 900,
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=45)
 
-    answer = (response.output_text or "").strip()
+    try:
+        async with _ai_http_semaphore:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(GROQ_API_URL, headers=headers, json=payload) as response:
+                    body = await response.json(content_type=None)
+                    if response.status == 401:
+                        raise RuntimeError("Groq rejected the API key. Check GROQ_API_KEY.")
+                    if response.status == 429:
+                        # Remove the unanswered prompt so history remains consistent.
+                        history.pop()
+                        raise RuntimeError(
+                            "The free AI limit has been reached for now. Please wait and try again."
+                        )
+                    if response.status >= 400:
+                        history.pop()
+                        message = body.get("error", {}).get("message", "Unknown API error") if isinstance(body, dict) else "Unknown API error"
+                        print(f"[VaultBot AI] Groq HTTP {response.status}: {message}")
+                        raise RuntimeError("The AI provider returned an error. Check the bot console.")
+    except asyncio.TimeoutError:
+        history.pop()
+        raise RuntimeError("The AI request timed out. Please try again.") from None
+    except aiohttp.ClientError as exc:
+        history.pop()
+        print(f"[VaultBot AI] Network error: {exc}")
+        raise RuntimeError("Couldn't connect to the AI provider. Try again shortly.") from None
+    except RuntimeError:
+        # RuntimeErrors raised above already have user-friendly messages.
+        raise
+
+    try:
+        answer = body["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError):
+        history.pop()
+        raise RuntimeError("The AI provider returned an unreadable response.") from None
+
     if not answer:
-        answer = "I couldn't generate a response this time. Please try again."
+        history.pop()
+        raise RuntimeError("The AI returned an empty response. Please try again.")
 
-    # Save only successful exchanges and keep a small rolling context window.
-    _conversations[key] = (
-        new_history + [{"role": "assistant", "content": answer}]
-    )[-MAX_HISTORY_MESSAGES:]
+    history.append({"role": "assistant", "content": answer})
+    # Bound history storage across many users/conversations.
+    if len(_ai_history) > 500:
+        oldest_key = next(iter(_ai_history))
+        if oldest_key != key:
+            _ai_history.pop(oldest_key, None)
     return answer
 
 
-def register_ai_commands(bot: commands.Bot) -> None:
-    """Register the prefix and slash AI commands on the existing bot."""
+async def _send_ai_chunks(send_func, answer: str) -> None:
+    """Send long AI replies as multiple Discord messages."""
+    remaining = answer
+    while remaining:
+        chunk = remaining[:1900]
+        if len(remaining) > 1900:
+            split_at = chunk.rfind("\n")
+            if split_at < 900:
+                split_at = chunk.rfind(" ")
+            if split_at > 900:
+                chunk = remaining[:split_at]
+        await send_func(chunk)
+        remaining = remaining[len(chunk):].lstrip()
 
-    @bot.command(name="ai", aliases=["askai"])
-    @commands.cooldown(1, 8.0, commands.BucketType.user)
-    async def ai_prefix(ctx: commands.Context, *, prompt: str = "") -> None:
-        """Ask VaultBot AI. Example: ~ai give me ideas for my server"""
-        if not prompt.strip():
-            await ctx.send("Usage: `~ai <your question>`")
-            return
-        if len(prompt) > MAX_PROMPT_LENGTH:
-            await ctx.send(f"Please keep your question under {MAX_PROMPT_LENGTH} characters.")
-            return
 
-        async with ctx.typing():
-            try:
-                answer = await _ask_ai(ctx.guild.id if ctx.guild else None, ctx.author.id, prompt.strip())
-            except RuntimeError as exc:
-                await ctx.send(str(exc))
-                return
-            except APIError as exc:
-                print(f"[VaultBot AI] OpenAI API request failed: {exc}")
-                await ctx.send("The AI service couldn't respond right now. Please try again shortly.")
-                return
-            except Exception as exc:
-                print(f"[VaultBot AI] Unexpected error: {exc}")
-                await ctx.send("Something went wrong while contacting the AI service.")
-                return
-
-        for chunk in _split_message(answer):
-            await ctx.send(chunk, allowed_mentions=discord.AllowedMentions.none())
-
-    @bot.tree.command(name="ask", description="Ask VaultBot AI a question")
-    @discord.app_commands.describe(prompt="What would you like to ask VaultBot AI?")
-    @discord.app_commands.checks.cooldown(1, 8.0, key=lambda interaction: interaction.user.id)
-    async def ai_slash(interaction: discord.Interaction, prompt: str) -> None:
-        if len(prompt) > MAX_PROMPT_LENGTH:
-            await interaction.response.send_message(
-                f"Please keep your question under {MAX_PROMPT_LENGTH} characters.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(thinking=True)
+@bot.command(name="ai", aliases=["askai"])
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def ai_command(ctx: commands.Context, *, question: str):
+    """Ask VaultBot's AI. Usage: ~ai your question"""
+    async with ctx.typing():
         try:
-            answer = await _ask_ai(
-                interaction.guild_id,
-                interaction.user.id,
-                prompt.strip(),
+            answer = await _groq_chat_reply(
+                ctx.author.id,
+                ctx.guild.id if ctx.guild else ctx.channel.id,
+                question[:4000],
             )
+            await _send_ai_chunks(ctx.send, answer)
         except RuntimeError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-        except APIError as exc:
-            print(f"[VaultBot AI] OpenAI API request failed: {exc}")
-            await interaction.followup.send(
-                "The AI service couldn't respond right now. Please try again shortly.",
-                ephemeral=True,
-            )
-            return
-        except Exception as exc:
-            print(f"[VaultBot AI] Unexpected error: {exc}")
-            await interaction.followup.send(
-                "Something went wrong while contacting the AI service.",
-                ephemeral=True,
-            )
-            return
+            await ctx.send(str(exc))
 
-        chunks = _split_message(answer)
-        await interaction.followup.send(
-            chunks[0], allowed_mentions=discord.AllowedMentions.none()
+
+@bot.tree.command(name="ask", description="Ask VaultBot's AI assistant")
+@discord.app_commands.describe(question="What would you like to ask VaultBot?")
+async def ask_ai_slash(interaction: discord.Interaction, question: str):
+    """Slash-command version of the AI chat."""
+    if not GROQ_API_KEY:
+        await interaction.response.send_message(
+            "AI isn't configured. The bot owner needs to add GROQ_API_KEY to the host environment.",
+            ephemeral=True,
         )
-        for chunk in chunks[1:]:
-            await interaction.followup.send(
-                chunk, allowed_mentions=discord.AllowedMentions.none()
-            )
+        return
+    await interaction.response.defer(thinking=True)
+    try:
+        answer = await _groq_chat_reply(
+            interaction.user.id,
+            interaction.guild_id or interaction.channel_id or 0,
+            question[:4000],
+        )
+        await _send_ai_chunks(interaction.followup.send, answer)
+    except RuntimeError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
 
-
-# Register AI commands on the existing bot.
-register_ai_commands(bot)
 
 
 # =============================================================================
