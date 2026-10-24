@@ -1615,6 +1615,64 @@ async def ask_ai_slash(interaction: discord.Interaction, question: str):
         await interaction.followup.send(str(exc), ephemeral=True)
 
 
+@bot.command(name="clear")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def clear_messages(ctx, amount: int = 100):
+    """Clear 1–100 messages. Defaults to 100."""
+
+    if not 1 <= amount <= 100:
+        await ctx.send(
+            "❌ Please choose a number between 1 and 100.",
+            delete_after=5
+        )
+        return
+
+    try:
+        # Include the command message in the cleanup.
+        deleted = await ctx.channel.purge(limit=amount + 1)
+
+        # Don't count the ~clear command itself.
+        count = max(0, len(deleted) - 1)
+
+        confirmation = await ctx.send(
+            f"✅ Cleared **{count}** message(s)!",
+            delete_after=5
+        )
+
+    except discord.Forbidden:
+        await ctx.send(
+            "❌ I need the **Manage Messages** permission "
+            "to clear messages.",
+            delete_after=5
+        )
+    except discord.HTTPException:
+        await ctx.send(
+            "❌ Discord couldn't clear the messages. "
+            "Some messages may be too old.",
+            delete_after=5
+        )
+
+
+@clear_messages.error
+async def clear_messages_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(
+            "❌ You need the **Manage Messages** permission "
+            "to use this command.",
+            delete_after=5
+        )
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(
+            "Usage: `~clear` or `~clear 1-100`",
+            delete_after=5
+        )
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(
+            "❌ Please enter a whole number from 1 to 100.",
+            delete_after=5
+        )
+
 
 # =============================================================================
 # 13. STARTUP
