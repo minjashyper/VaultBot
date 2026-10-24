@@ -1,5 +1,5 @@
 """
-VaultBot — a Discord music + community bot.
+VaultBot â€” a Discord music + community bot.
 
 File layout
 -----------
@@ -288,7 +288,7 @@ def clean_temp_file(path: Optional[str]) -> None:
 def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> discord.Embed:
     """Embed shown by the 'Now Playing' announcement and ~nowplaying."""
     embed = discord.Embed(
-        title="🎶 Now Playing",
+        title="ðŸŽ¶ Now Playing",
         description=f"[{discord.utils.escape_markdown(track.title)}]({track.webpage_url})",
         color=BRAND_COLOR,
     )
@@ -424,7 +424,7 @@ async def play_next(ctx: commands.Context) -> None:
         except Exception as error:
             clean_temp_file(track.local_path)
             await ctx.send(
-                f"⚠️ Couldn't play **{discord.utils.escape_markdown(track.title)}**: "
+                f"âš ï¸ Couldn't play **{discord.utils.escape_markdown(track.title)}**: "
                 f"{discord.utils.escape_markdown(str(error))[:300]}"
             )
             current_tracks.pop(guild_id, None)
@@ -449,7 +449,7 @@ async def queue_track(ctx: commands.Context, track: Track) -> None:
     guild_id = ctx.guild.id
     get_queue(guild_id).append(track)
     await ctx.send(
-        f"➕ Added **{discord.utils.escape_markdown(track.title)}** "
+        f"âž• Added **{discord.utils.escape_markdown(track.title)}** "
         f"(`{format_duration(track.duration)}`) to the queue. Position: "
         f"{len(get_queue(guild_id))}"
     )
@@ -594,7 +594,7 @@ async def juicewrld_tracker_task():
             editor = _juicewrld_safe(item.get("user"), "Unknown", 100)
 
             embed = discord.Embed(
-                title=f"🎵 Juice WRLD Tracker Update: {title}",
+                title=f"ðŸŽµ Juice WRLD Tracker Update: {title}",
                 description=f"**Action:** {action}\n**Updated by:** {editor}",
                 color=JUICE_COLOR
             )
@@ -636,7 +636,7 @@ async def juicewrld_tracker_task():
                 embed.url = link
 
             embed.set_footer(
-                text="Juice WRLD API • Tracker event (not necessarily a new release)"
+                text="Juice WRLD API â€¢ Tracker event (not necessarily a new release)"
             )
 
             await channel.send(
@@ -677,7 +677,7 @@ HELP_PAGES: list[dict] = [
     {
         "key": "home",
         "aliases": ("overview", "start", "main"),
-        "emoji": "🏠",
+        "emoji": "ðŸ ",
         "title": "Overview",
         "summary": "What VaultBot does and where to find everything",
         "color": BRAND_COLOR,
@@ -687,26 +687,26 @@ HELP_PAGES: list[dict] = [
             "announcements.\n\n"
             f"**Prefix commands** start with `{PREFIX}` and **slash commands** "
             "start with `/`.\n"
-            "Use the ◀ ▶ buttons or the dropdown below to browse every feature."
+            "Use the â—€ â–¶ buttons or the dropdown below to browse every feature."
         ),
         "fields": [
             (
-                "🎵 Music Player — pages 2 & 3",
+                "ðŸŽµ Music Player â€” pages 2 & 3",
                 "Play songs by name or link, or upload your own audio file. "
                 "Comes with a queue, loop modes, volume control, and more.",
             ),
             (
-                "🧃 Juice WRLD Tools — page 4",
+                "ðŸ§ƒ Juice WRLD Tools â€” page 4",
                 "Search the Juice WRLD catalog and get automatic tracker "
                 "updates posted to a channel.",
             ),
             (
-                "📣 Server Tools — page 5",
+                "ðŸ“£ Server Tools â€” page 5",
                 "Slash commands for posting music releases, sending "
                 "announcements, and checking the bot's latency.",
             ),
             (
-                "💡 Tips & Troubleshooting — page 6",
+                "ðŸ’¡ Tips & Troubleshooting â€” page 6",
                 "Requirements, supported sources, and fixes for common problems.",
             ),
         ],
@@ -714,7 +714,7 @@ HELP_PAGES: list[dict] = [
     {
         "key": "music",
         "aliases": ("play", "queue", "skip", "stop", "playback"),
-        "emoji": "🎵",
+        "emoji": "ðŸŽµ",
         "title": "Music: Play & Queue",
         "summary": "Play songs, upload files, view the queue, skip, stop",
         "color": BRAND_COLOR,
@@ -724,7 +724,7 @@ HELP_PAGES: list[dict] = [
         ),
         "fields": [
             (
-                f"`{PREFIX}play <song or URL>`  •  `{PREFIX}p`",
+                f"`{PREFIX}play <song or URL>`  â€¢  `{PREFIX}p`",
                 "Searches for the song (or opens the link you give it), "
                 "downloads the audio, and adds it to the queue. If nothing is "
                 "playing, it starts right away.",
@@ -735,12 +735,12 @@ HELP_PAGES: list[dict] = [
                 f"Supports MP3, WAV, Opus, OGG, M4A, and FLAC up to {MAX_UPLOAD_MB} MB.",
             ),
             (
-                f"`{PREFIX}queue`  •  `{PREFIX}q`",
+                f"`{PREFIX}queue`  â€¢  `{PREFIX}q`",
                 "Shows what's playing now, the next 10 songs in line, how many "
                 "more are queued, and the current loop mode.",
             ),
             (
-                f"`{PREFIX}skip`  •  `{PREFIX}s`",
+                f"`{PREFIX}skip`  â€¢  `{PREFIX}s`",
                 "Skips the current song and moves on to the next one in the queue.",
             ),
             (
@@ -753,36 +753,36 @@ HELP_PAGES: list[dict] = [
     {
         "key": "controls",
         "aliases": ("volume", "loop", "pause", "resume", "nowplaying", "leave"),
-        "emoji": "🎛️",
+        "emoji": "ðŸŽ›ï¸",
         "title": "Music: Controls & Loop",
         "summary": "Pause, resume, volume, now playing, loop modes, leave",
         "color": BRAND_COLOR,
         "description": "Fine-tune playback while a song is going.",
         "fields": [
             (
-                f"`{PREFIX}pause`  /  `{PREFIX}resume`  •  `{PREFIX}unpause`",
+                f"`{PREFIX}pause`  /  `{PREFIX}resume`  â€¢  `{PREFIX}unpause`",
                 "Pause the current song and pick it back up right where you left off.",
             ),
             (
-                f"`{PREFIX}volume <0-100>`  •  `{PREFIX}vol`",
+                f"`{PREFIX}volume <0-100>`  â€¢  `{PREFIX}vol`",
                 "Sets the playback volume for this server. "
                 f"The default is {int(DEFAULT_VOLUME * 100)}%. "
                 "The change applies instantly, even mid-song.",
             ),
             (
-                f"`{PREFIX}nowplaying`  •  `{PREFIX}np`  •  `{PREFIX}current`",
+                f"`{PREFIX}nowplaying`  â€¢  `{PREFIX}np`  â€¢  `{PREFIX}current`",
                 "Shows the current song with a link, its duration, and who requested it.",
             ),
             (
                 f"`{PREFIX}loop <song|queue|off>`",
-                "**song** — repeats the current track\n"
-                "**queue** — cycles through the whole queue forever\n"
-                "**off** — plays normally (default)\n"
+                "**song** â€” repeats the current track\n"
+                "**queue** â€” cycles through the whole queue forever\n"
+                "**off** â€” plays normally (default)\n"
                 "*Also accepts `track`, `all`, and `none`.* "
                 f"Using `{PREFIX}skip` while on **song** loop turns the loop off.",
             ),
             (
-                f"`{PREFIX}leave`  •  `{PREFIX}disconnect`",
+                f"`{PREFIX}leave`  â€¢  `{PREFIX}disconnect`",
                 "Clears the queue and disconnects the bot from the voice channel.",
             ),
         ],
@@ -790,23 +790,23 @@ HELP_PAGES: list[dict] = [
     {
         "key": "juice",
         "aliases": ("jw", "jwsong", "tracker", "juicewrld"),
-        "emoji": "🧃",
+        "emoji": "ðŸ§ƒ",
         "title": "Juice WRLD Tools",
         "summary": "Catalog search and automatic tracker updates",
         "color": JUICE_COLOR,
         "description": (
-            "Catalog features powered by the Juice WRLD API. Information only — "
+            "Catalog features powered by the Juice WRLD API. Information only â€” "
             "these tools don't play audio."
         ),
         "fields": [
             (
                 f"`{PREFIX}jwsong <search>`",
-                "Searches the Juice WRLD catalog and shows up to 5 matches with "
-                "the artist, category, album, and catalog ID.\n"
+                "Searches the Juice WRLD catalog, opens a detailed song embed, "
+                "and lets you choose alternate or related matches from a dropdown.\n"
                 f"Example: `{PREFIX}jwsong lucid dreams`",
             ),
             (
-                "📡 Automatic Tracker Feed",
+                "ðŸ“¡ Automatic Tracker Feed",
                 "When the bot owner picks a channel for it, VaultBot checks the "
                 "tracker on a timer and posts every new update: the song name, "
                 "what happened, who updated it, which fields changed, and any "
@@ -818,14 +818,14 @@ HELP_PAGES: list[dict] = [
     {
         "key": "slash",
         "aliases": ("server", "admin", "staff", "announce", "musicdrop", "ping"),
-        "emoji": "📣",
+        "emoji": "ðŸ“£",
         "title": "Server Tools (Slash Commands)",
         "summary": "/musicdrop, /announce, /ping and /help",
         "color": BRAND_COLOR,
         "description": "Type `/` in the message box to see these. Some are staff-only.",
         "fields": [
             (
-                "`/musicdrop`  🔒 Manage Messages",
+                "`/musicdrop`  ðŸ”’ Manage Messages",
                 "Posts a polished music release in a channel of your choice: "
                 "title, description, square artwork, an artist footer, and "
                 "**mp3** / **wav** download buttons.\n"
@@ -835,7 +835,7 @@ HELP_PAGES: list[dict] = [
                 "Links in the target channel.",
             ),
             (
-                "`/announce`  🔒 Administrator",
+                "`/announce`  ðŸ”’ Administrator",
                 "Sends an announcement to any channel. Set `ping_everyone` to "
                 "True to include an @everyone ping (off by default).",
             ),
@@ -854,36 +854,36 @@ HELP_PAGES: list[dict] = [
     {
         "key": "tips",
         "aliases": ("faq", "troubleshooting", "problems", "info"),
-        "emoji": "💡",
+        "emoji": "ðŸ’¡",
         "title": "Tips & Troubleshooting",
         "summary": "Requirements, supported sources, and common fixes",
         "color": BRAND_COLOR,
         "description": "Quick answers if something isn't working the way you expect.",
         "fields": [
             (
-                "🔊 Before you play",
-                "Join a voice channel first — the bot follows you in. It needs "
+                "ðŸ”Š Before you play",
+                "Join a voice channel first â€” the bot follows you in. It needs "
                 "**Connect** and **Speak** permissions, plus **Send Messages** "
                 "and **Embed Links** in the text channel.",
             ),
             (
-                "🔗 What you can play",
+                "ðŸ”— What you can play",
                 "Song names (searched automatically), public links that yt-dlp "
                 "supports such as YouTube and SoundCloud, and uploaded audio "
                 "files. Each command adds a single track, not a full playlist.\n"
-                "Spotify and Apple Music links can't be streamed directly — use "
+                "Spotify and Apple Music links can't be streamed directly â€” use "
                 "the song title or a YouTube/SoundCloud link instead.",
             ),
             (
-                "⚠️ If something goes wrong",
-                "**\"YouTube is blocking this bot\"** — the bot owner needs to "
+                "âš ï¸ If something goes wrong",
+                "**\"YouTube is blocking this bot\"** â€” the bot owner needs to "
                 "refresh the YouTube cookies and restart the bot.\n"
-                "**\"Couldn't play\"** — try the song again or use a different link.\n"
-                "**\"Missing argument\"** — check the usage shown for that "
+                "**\"Couldn't play\"** â€” try the song again or use a different link.\n"
+                "**\"Missing argument\"** â€” check the usage shown for that "
                 "command on the earlier pages.",
             ),
             (
-                "🧭 Using this menu",
+                "ðŸ§­ Using this menu",
                 "Only the person who opened the menu can use its buttons. It "
                 f"stops responding after 2 minutes, so just run `{PREFIX}help` "
                 "or `/help` again. Jump to a page directly, e.g. "
@@ -911,7 +911,7 @@ def find_help_page(topic: Optional[str]) -> int:
 def build_help_embed(index: int) -> discord.Embed:
     page = HELP_PAGES[index]
     embed = discord.Embed(
-        title=f"{page['emoji']} VaultBot — {page['title']}",
+        title=f"{page['emoji']} VaultBot â€” {page['title']}",
         description=page["description"],
         color=page["color"],
     )
@@ -921,13 +921,13 @@ def build_help_embed(index: int) -> discord.Embed:
     # Live status line on the Juice WRLD page.
     if page["key"] == "juice":
         if JUICEWRLD_CHANNEL_ID:
-            status = f"✅ Enabled — checks every {JUICEWRLD_POLL_MINUTES} minute(s)."
+            status = f"âœ… Enabled â€” checks every {JUICEWRLD_POLL_MINUTES} minute(s)."
         else:
-            status = "❌ Not enabled on this bot (the owner hasn't set a channel)."
+            status = "âŒ Not enabled on this bot (the owner hasn't set a channel)."
         embed.add_field(name="Tracker status", value=status, inline=False)
 
     embed.set_footer(
-        text=f"Page {index + 1} of {len(HELP_PAGES)}  •  Prefix: {PREFIX}  •  Slash: /"
+        text=f"Page {index + 1} of {len(HELP_PAGES)}  â€¢  Prefix: {PREFIX}  â€¢  Slash: /"
     )
     return embed
 
@@ -984,7 +984,7 @@ class HelpView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
-    @discord.ui.button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Previous", emoji="â—€ï¸", style=discord.ButtonStyle.secondary)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
         await self._show(interaction)
@@ -993,13 +993,13 @@ class HelpView(discord.ui.View):
     async def indicator(self, interaction: discord.Interaction, button: discord.ui.Button):
         pass  # Display-only page counter.
 
-    @discord.ui.button(label="Next", emoji="▶️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Next", emoji="â–¶ï¸", style=discord.ButtonStyle.primary)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(len(HELP_PAGES) - 1, self.page + 1)
         await self._show(interaction)
 
     @discord.ui.select(
-        placeholder="Jump to a page…",
+        placeholder="Jump to a pageâ€¦",
         options=_HELP_SELECT_OPTIONS,
         min_values=1,
         max_values=1,
@@ -1118,7 +1118,7 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
 
     if not query.strip():
         return await ctx.send(
-            f"Usage: `{PREFIX}play song name or URL` — or attach an audio file to `{PREFIX}play`."
+            f"Usage: `{PREFIX}play song name or URL` â€” or attach an audio file to `{PREFIX}play`."
         )
 
     # Spotify and Apple Music links may provide metadata or a playable match,
@@ -1133,7 +1133,7 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         print(f"yt-dlp error: {error_text}", flush=True)
         if "confirm you" in error_text and "not a bot" in error_text:
             await ctx.send(
-                "⚠️ YouTube is blocking this bot's server. The YouTube cookies are "
+                "âš ï¸ YouTube is blocking this bot's server. The YouTube cookies are "
                 "missing, expired, or not being accepted. The bot owner needs to "
                 "export fresh cookies (see the setup notes) and restart the bot."
             )
@@ -1153,7 +1153,7 @@ async def queue_command(ctx: commands.Context):
     guild_id = ctx.guild.id
     tracks = list(get_queue(guild_id))
     current = current_tracks.get(guild_id)
-    embed = discord.Embed(title="🎵 Music Queue", color=BRAND_COLOR)
+    embed = discord.Embed(title="ðŸŽµ Music Queue", color=BRAND_COLOR)
     if current:
         embed.add_field(
             name="Now playing",
@@ -1163,7 +1163,7 @@ async def queue_command(ctx: commands.Context):
     if tracks:
         lines = [
             f"`{i}.` [{discord.utils.escape_markdown(t.title)}]({t.webpage_url}) "
-            f"— `{format_duration(t.duration)}`"
+            f"â€” `{format_duration(t.duration)}`"
             for i, t in enumerate(tracks[:10], start=1)
         ]
         embed.add_field(name=f"Up next ({len(tracks)} queued)", value="\n".join(lines), inline=False)
@@ -1182,7 +1182,7 @@ async def skip_command(ctx: commands.Context):
         return await ctx.send("Nothing is playing right now.")
     loop_modes[ctx.guild.id] = "off" if loop_modes.get(ctx.guild.id) == "song" else loop_modes.get(ctx.guild.id, "off")
     voice.stop()
-    await ctx.send("⏭️ Skipped the current song.")
+    await ctx.send("â­ï¸ Skipped the current song.")
 
 
 @bot.command(name="stop")
@@ -1197,7 +1197,7 @@ async def stop_command(ctx: commands.Context):
         if voice.is_playing() or voice.is_paused():
             voice.stop()
         await voice.disconnect()
-    await ctx.send("⏹️ Playback stopped and the queue was cleared.")
+    await ctx.send("â¹ï¸ Playback stopped and the queue was cleared.")
 
 
 @bot.command(name="pause")
@@ -1205,7 +1205,7 @@ async def pause_command(ctx: commands.Context):
     voice = ctx.guild.voice_client if ctx.guild else None
     if voice and voice.is_playing():
         voice.pause()
-        await ctx.send("⏸️ Paused.")
+        await ctx.send("â¸ï¸ Paused.")
     else:
         await ctx.send("Nothing is currently playing.")
 
@@ -1215,7 +1215,7 @@ async def resume_command(ctx: commands.Context):
     voice = ctx.guild.voice_client if ctx.guild else None
     if voice and voice.is_paused():
         voice.resume()
-        await ctx.send("▶️ Resumed.")
+        await ctx.send("â–¶ï¸ Resumed.")
     else:
         await ctx.send("Playback isn't paused.")
 
@@ -1230,7 +1230,7 @@ async def volume_command(ctx: commands.Context, percent: int):
     voice = ctx.guild.voice_client
     if voice and voice.source and isinstance(voice.source, discord.PCMVolumeTransformer):
         voice.source.volume = percent / 100
-    await ctx.send(f"🔊 Volume set to **{percent}%**.")
+    await ctx.send(f"ðŸ”Š Volume set to **{percent}%**.")
 
 
 @bot.command(name="nowplaying", aliases=["np", "current"])
@@ -1250,7 +1250,7 @@ async def loop_command(ctx: commands.Context, mode: str = "off"):
     if mode not in aliases:
         return await ctx.send(f"Usage: `{PREFIX}loop song`, `{PREFIX}loop queue`, or `{PREFIX}loop off`.")
     loop_modes[ctx.guild.id] = aliases[mode]
-    await ctx.send(f"🔁 Loop mode set to **{aliases[mode]}**.")
+    await ctx.send(f"ðŸ” Loop mode set to **{aliases[mode]}**.")
 
 
 @bot.command(name="leave", aliases=["disconnect"])
@@ -1265,51 +1265,266 @@ async def leave_command(ctx: commands.Context):
     if voice.is_playing() or voice.is_paused():
         voice.stop()
     await voice.disconnect()
-    await ctx.send("👋 Disconnected from voice.")
+    await ctx.send("ðŸ‘‹ Disconnected from voice.")
 
 
 # ---- Juice WRLD ----
 
-@bot.command(name="jwsong")
+def _jw_plain(value, fallback="", limit=900):
+    """Convert API metadata to safe, readable text for Discord embeds."""
+    if value is None:
+        return fallback
+    if isinstance(value, (list, tuple, set)):
+        parts = [_jw_plain(item, "", 250) for item in value]
+        text = ", ".join(part for part in parts if part)
+    elif isinstance(value, dict):
+        parts = [f"{key}: {_jw_plain(item, '', 200)}" for key, item in value.items()
+                 if item not in (None, "", [], {})]
+        text = "\n".join(parts)
+    else:
+        text = str(value).strip()
+    text = text.replace("@", "@\u200b").strip()
+    return text[:limit]
+
+
+def _jw_has_value(value):
+    return value not in (None, "", [], {}, False)
+
+
+def _jw_song_score(song, query):
+    """Rank exact title and alternate-title matches above broad search matches."""
+    query_norm = "".join(ch.casefold() for ch in query if ch.isalnum())
+    names = [song.get("name", "")]
+    titles = song.get("track_titles") or []
+    if isinstance(titles, str):
+        titles = [titles]
+    names.extend(titles if isinstance(titles, list) else [])
+    normalized = ["".join(ch.casefold() for ch in str(name) if ch.isalnum())
+                  for name in names if name]
+    if query_norm and query_norm in normalized:
+        return 100
+    if query_norm and any(query_norm in name for name in normalized):
+        return 80
+    if query_norm and any(name in query_norm for name in normalized if name):
+        return 60
+    return 10
+
+
+def _build_juicewrld_song_embed(song, query=""):
+    """Build a detailed song page from whichever metadata the API supplies."""
+    name = _juicewrld_safe(song.get("name"), "Unknown title", 250)
+    embed = discord.Embed(title=f"ðŸŽµ {name}", color=JUICE_COLOR)
+
+    category = _jw_plain(song.get("category"), "Unknown")
+    artist = _jw_plain(song.get("credited_artists"), "Juice WRLD")
+    summary = [f"**Artist:** {artist}", f"**Category:** {category}"]
+    era = song.get("era")
+    if isinstance(era, dict):
+        era_name = _jw_plain(era.get("name"), "")
+        era_period = _jw_plain(era.get("time_frame"), "")
+        if era_name:
+            summary.append(f"**Era:** {era_name}" + (f" â€” {era_period}" if era_period else ""))
+    elif _jw_has_value(era):
+        summary.append(f"**Era:** {_jw_plain(era)}")
+    album = _jw_plain(song.get("album"), "")
+    if album:
+        summary.append(f"**Album:** {album}")
+    if _jw_has_value(song.get("version_title")):
+        summary.append(f"**Version:** {_jw_plain(song.get('version_title'), limit=150)}")
+    embed.description = "\n".join(summary)[:4000]
+
+    # The API returns a large catalogue object, but Discord embeds have strict
+    # field and total-character limits. Include as much non-empty metadata as fits.
+    fields = [
+        ("Alternate titles", song.get("track_titles")),
+        ("Producers", song.get("producers")),
+        ("Engineers", song.get("engineers")),
+        ("Recording locations", song.get("recording_locations")),
+        ("Recording dates", song.get("record_dates")),
+        ("Track length", song.get("length")),
+        ("Release date", song.get("release_date")),
+        ("Preview date", song.get("preview_date")),
+        ("Other dates", song.get("dates")),
+        ("Leak information", "\n".join(
+            f"{label}: {_jw_plain(song.get(key), '', 250)}"
+            for label, key in (("Date leaked", "date_leaked"), ("Leak type", "leak_type"))
+            if _jw_has_value(song.get(key))
+        )),
+        ("File names", song.get("file_names")),
+        ("Instrumentals", song.get("instrumentals") or song.get("instrumental_names")),
+        ("Session titles", song.get("session_titles")),
+        ("Session tracking", song.get("session_tracking")),
+        ("Snippets", song.get("snippets")),
+        ("Additional information", song.get("additional_information")),
+        ("Notes", song.get("notes")),
+        ("Group-buy information", song.get("groupbuy_info")),
+        ("Version records", song.get("versions")),
+    ]
+
+    used_chars = len(embed.title or "") + len(embed.description or "")
+    for field_name, raw_value in fields:
+        if not _jw_has_value(raw_value):
+            continue
+        value = _jw_plain(raw_value, "", 900)
+        if not value:
+            continue
+        if used_chars + len(field_name) + len(value) > 5700 or len(embed.fields) >= 24:
+            break
+        embed.add_field(name=field_name, value=value, inline=False)
+        used_chars += len(field_name) + len(value)
+
+    if song.get("lyrics"):
+        lyrics = _jw_plain(song.get("lyrics"), "", 650)
+        if lyrics and used_chars + len("Lyrics preview") + len(lyrics) < 5900 and len(embed.fields) < 25:
+            embed.add_field(name="Lyrics preview", value=lyrics + ("â€¦" if len(str(song.get("lyrics", ""))) > 650 else ""), inline=False)
+            used_chars += len(lyrics)
+
+    image_url = song.get("image_url")
+    if isinstance(image_url, str) and image_url.strip():
+        if image_url.startswith("/"):
+            image_url = "https://juicewrldapi.com" + image_url
+        if image_url.startswith("https://") or image_url.startswith("http://"):
+            embed.set_thumbnail(url=image_url)
+
+    catalog_id = song.get("public_id") or song.get("id")
+    footer_parts = []
+    if catalog_id is not None:
+        footer_parts.append(f"Catalog ID: {catalog_id}")
+    if song.get("id") is not None:
+        footer_parts.append(f"Database ID: {song.get('id')}")
+    footer_parts.append("Metadata: Juice WRLD Community API")
+    embed.set_footer(text=" â€¢ ".join(footer_parts)[:2048])
+    return embed
+
+
+class JuiceWRLDSongSelect(discord.ui.Select):
+    def __init__(self, songs, owner_id):
+        self.owner_id = owner_id
+        options = []
+        for song in songs[:25]:
+            song_id = song.get("id")
+            if song_id is None:
+                continue
+            title = _juicewrld_safe(song.get("name"), "Unknown title", 75)
+            category = _juicewrld_safe(song.get("category"), "Unknown category", 35)
+            version = song.get("version_title")
+            if version:
+                title = f"{title} â€” {_juicewrld_safe(version, limit=20)}"[:100]
+            era = song.get("era")
+            if isinstance(era, dict):
+                era = era.get("name")
+            description_parts = [category]
+            if era:
+                description_parts.append(_juicewrld_safe(era, limit=30))
+            if song.get("album"):
+                description_parts.append(_juicewrld_safe(song.get("album"), limit=30))
+            options.append(discord.SelectOption(
+                label=title[:100],
+                value=str(song_id),
+                description=" â€¢ ".join(description_parts)[:100]
+            ))
+        super().__init__(
+            placeholder="Choose another matching song or versionâ€¦",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran the search can change this song page.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            song_id = int(self.values[0])
+            payload = await _juicewrld_api_get(f"/songs/{song_id}/")
+            if not isinstance(payload, dict) or not payload.get("id"):
+                raise ValueError("API returned no song detail object")
+            # The collection endpoint has extra version labels that detail does not
+            # necessarily return, so retain those from the selected option.
+            selected = next((item for item in self.view.songs
+                             if str(item.get("id")) == str(song_id)), {})
+            merged = dict(selected)
+            merged.update(payload)
+            embed = _build_juicewrld_song_embed(merged)
+            await interaction.response.edit_message(embed=embed, view=self.view)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] Detail lookup failed: {exc}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "I couldn't load that song's full details. Please try selecting it again.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "I couldn't load that song's full details. Please try selecting it again.",
+                    ephemeral=True
+                )
+
+
+class JuiceWRLDSongView(discord.ui.View):
+    def __init__(self, songs, owner_id):
+        super().__init__(timeout=180)
+        self.songs = songs
+        self.owner_id = owner_id
+        select = JuiceWRLDSongSelect(songs, owner_id)
+        if select.options:
+            self.add_item(select)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if getattr(self, "message", None):
+            try:
+                await self.message.edit(view=self)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+@bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
 async def juicewrld_song_search(ctx: commands.Context, *, query: str):
-    """Search Juice WRLD catalog metadata. Usage: ~jwsong lucid dreams"""
+    """Search the Juice WRLD catalog and browse full song details."""
     try:
         payload = await _juicewrld_api_get(
             "/songs/",
-            params={"search": query, "page_size": 5}
+            params={"search": query, "page_size": 25, "versions": "true"}
         )
-        songs = _juicewrld_items(payload)
-
+        songs = [song for song in _juicewrld_items(payload)
+                 if isinstance(song, dict) and song.get("id") is not None]
         if not songs:
             await ctx.send(
                 f"No Juice WRLD catalog results found for **{query[:100]}**."
             )
             return
 
-        embed = discord.Embed(
-            title=f"🔎 Juice WRLD Search: {query[:200]}",
-            color=JUICE_COLOR
-        )
+        # Put the closest title/alternate-title match first, then keep the API's
+        # order for equally relevant results. The dropdown can show up to 25.
+        songs = sorted(songs, key=lambda song: _jw_song_score(song, query), reverse=True)
+        first = songs[0]
+        try:
+            detail = await _juicewrld_api_get(f"/songs/{int(first['id'])}/")
+            if isinstance(detail, dict) and detail.get("id") is not None:
+                merged = dict(first)
+                merged.update(detail)
+                first = merged
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] Initial detail lookup failed: {exc}")
 
-        for song in songs[:5]:
-            if not isinstance(song, dict):
-                continue
-            name = _juicewrld_safe(song.get("name"), "Unknown title", 250)
-            category = _juicewrld_safe(
-                song.get("category"), "Uncategorized", 100
+        view = JuiceWRLDSongView(songs, ctx.author.id) if len(songs) > 1 else None
+        embed = _build_juicewrld_song_embed(first, query)
+        if len(songs) > 1:
+            embed.add_field(
+                name="Related results",
+                value=(f"Found **{len(songs)}** matching or related catalog entries. "
+                       "Use the dropdown below to open another song or version."),
+                inline=False
             )
-            artists = _juicewrld_safe(
-                song.get("credited_artists"), "Juice WRLD", 200
-            )
-            details = f"Artist: {artists}\nCategory: {category}"
-            if song.get("id") is not None:
-                details += f"\nCatalog ID: `{song['id']}`"
-            if song.get("album"):
-                details += f"\nAlbum: {_juicewrld_safe(song['album'], limit=150)}"
-            embed.add_field(name=name, value=details[:1024], inline=False)
-
-        embed.set_footer(text="Catalog information from Juice WRLD API")
-        await ctx.send(embed=embed)
+        message = await ctx.send(embed=embed, view=view)
+        if view:
+            view.message = message
 
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         print(f"[JuiceWRLD] Song search failed: {exc}")
@@ -1424,8 +1639,8 @@ async def musicdrop(
     embed.set_thumbnail(url=artwork_url)
     embed.set_footer(text=artist)
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="mp3", emoji="💿", style=discord.ButtonStyle.link, url=mp3_url))
-    view.add_item(discord.ui.Button(label="wav", emoji="💿", style=discord.ButtonStyle.link, url=wav_url))
+    view.add_item(discord.ui.Button(label="mp3", emoji="ðŸ’¿", style=discord.ButtonStyle.link, url=mp3_url))
+    view.add_item(discord.ui.Button(label="wav", emoji="ðŸ’¿", style=discord.ButtonStyle.link, url=wav_url))
 
     await interaction.response.defer(ephemeral=True)
     try:
@@ -1630,11 +1845,11 @@ async def ask_ai_slash(interaction: discord.Interaction, question: str):
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
 async def clear_messages(ctx: commands.Context, amount: int = 100):
-    """Clear 1–100 recent messages. Defaults to 100, plus the command message."""
+    """Clear 1â€“100 recent messages. Defaults to 100, plus the command message."""
 
     if not 1 <= amount <= 100:
         await ctx.send(
-            "❌ Please choose a number between 1 and 100.",
+            "âŒ Please choose a number between 1 and 100.",
             delete_after=5,
         )
         return
@@ -1645,7 +1860,7 @@ async def clear_messages(ctx: commands.Context, amount: int = 100):
     if bot_member is None:
         print("[CLEAR] Could not resolve the bot's guild member.")
         await ctx.send(
-            "❌ I couldn't check my server permissions. Please try again.",
+            "âŒ I couldn't check my server permissions. Please try again.",
             delete_after=5,
         )
         return
@@ -1664,7 +1879,7 @@ async def clear_messages(ctx: commands.Context, amount: int = 100):
             f"{ctx.channel.id}: {missing_text}"
         )
         await ctx.send(
-            f"❌ I need **{missing_text}** permission(s) in this channel "
+            f"âŒ I need **{missing_text}** permission(s) in this channel "
             "to clear messages. Check the channel's permission overrides.",
             delete_after=8,
         )
@@ -1680,7 +1895,7 @@ async def clear_messages(ctx: commands.Context, amount: int = 100):
             f"requested={amount}, deleted_other_messages={count}"
         )
         await ctx.send(
-            f"✅ Cleared **{count}** message(s)!",
+            f"âœ… Cleared **{count}** message(s)!",
             delete_after=5,
         )
 
@@ -1695,7 +1910,7 @@ async def clear_messages(ctx: commands.Context, amount: int = 100):
         )
         try:
             await ctx.send(
-                "❌ Discord denied the deletion. Recheck this channel's "
+                "âŒ Discord denied the deletion. Recheck this channel's "
                 "permissions for the bot and its role.",
                 delete_after=8,
             )
@@ -1709,7 +1924,7 @@ async def clear_messages(ctx: commands.Context, amount: int = 100):
         )
         try:
             await ctx.send(
-                "❌ Discord couldn't complete the cleanup. Check the bot "
+                "âŒ Discord couldn't complete the cleanup. Check the bot "
                 "console for the `[CLEAR]` error details.",
                 delete_after=8,
             )
@@ -1721,7 +1936,7 @@ async def clear_messages(ctx: commands.Context, amount: int = 100):
 async def clear_messages_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(
-            "❌ You need the **Manage Messages** permission to use this command.",
+            "âŒ You need the **Manage Messages** permission to use this command.",
             delete_after=5,
         )
     elif isinstance(error, commands.MissingRequiredArgument):
@@ -1731,15 +1946,15 @@ async def clear_messages_error(ctx: commands.Context, error: commands.CommandErr
         )
     elif isinstance(error, commands.BadArgument):
         await ctx.send(
-            "❌ Please enter a whole number from 1 to 100.",
+            "âŒ Please enter a whole number from 1 to 100.",
             delete_after=5,
         )
     elif isinstance(error, commands.NoPrivateMessage):
-        await ctx.send("❌ Use this command inside a server.", delete_after=5)
+        await ctx.send("âŒ Use this command inside a server.", delete_after=5)
     else:
         print(f"[CLEAR] Command setup error: {type(error).__name__}: {error}")
         await ctx.send(
-            "❌ The clear command couldn't run. Check the bot console for details.",
+            "âŒ The clear command couldn't run. Check the bot console for details.",
             delete_after=5,
         )
 
