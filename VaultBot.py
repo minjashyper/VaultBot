@@ -3104,20 +3104,6 @@ def _tidy(t: str, limit: int) -> str:
     return t
 
 
-def clean_contents(text: str, limit: int = 3500) -> str:
-    """Steam posts use BBCode ([b], [list], [img]...). Make it readable plain text."""
-    t = text or ""
-    t = re.sub(r"\[img\].*?\[/img\]", "", t, flags=re.I | re.S)
-    t = re.sub(r"\[previewyoutube=[^\]]*\](?:\[/previewyoutube\])?", "", t, flags=re.I)
-    t = re.sub(r"\[url=[^\]]*\](.*?)\[/url\]", r"\1", t, flags=re.I | re.S)
-    t = re.sub(r"\[h[1-6]\](.*?)\[/h[1-6]\]", r"**\1**", t, flags=re.I | re.S)
-    t = re.sub(r"\[b\](.*?)\[/b\]", r"**\1**", t, flags=re.I | re.S)
-    t = t.replace("[*]", "\n• ")
-    t = re.sub(r"\[/?[a-z0-9_]+(?:=[^\]]*)?\]", "", t, flags=re.I)   # any other tag
-    t = re.sub(r"\{STEAM_CLAN_IMAGE\}\S*", "", t)
-    return _tidy(t, limit)
-
-
 def html_to_text(raw: str, limit: int = 3500) -> str:
     """Minecraft's notes are HTML. Keep headings and bullets, drop the rest."""
     t = raw or ""
@@ -3145,57 +3131,415 @@ def _parse_date(value) -> int:
     return int(time.time())
 
 
-def build_embed(appid: str, game: str, item: dict) -> discord.Embed:
-    """Build a polished, information-rich cyber-style update card."""
-    title = (item.get("title") or "UPDATE DETECTED").strip()[:256]
-    description = (item.get("contents") or "").strip()
-    if not item.get("plain"):
-        description = clean_contents(description, 3800)
+#  ── Steam BBCode → Discord markdown ─────────────────────────────────────────
+#  Steam posts are written in BBCode ([p], [h2], [list], [*], [url=..], [img]..).
+#  The old converter deleted the tags WITHOUT leaving line breaks behind, which
+#  is why paragraphs, headings and bullets were glued into one wall of text.
+#  This one turns every tag into the right Discord equivalent instead.
+_HEAD_OPEN, _HEAD_CLOSE = "\x01", "\x02"          # private markers around heading text
+STEAM_CLAN_IMAGE = "https://clan.fastly.steamstatic.com/images/"
+_BBCODE_TAGS = (r"b|i|u|strike|s|spoiler|noparse|url|img|code|quote|list|olist|hr|br|p|"
+                r"table|tr|td|th|h[1-6]|previewyoutube|video")
+
+
+def _md_link(text: str, url: str) -> str:
+    url = (url or "").strip().strip('"\'')
+    text = (text or "").strip()
+    if not url.startswith(("https://", "http://")):
+        return text
+    if not text or text == url:
+        text = re.sub(r"^https?://(?:www\.)?", "", url).split("/")[0] + "/…"
+    text = text.replace("[", "(").replace("]", ")")
+    return f"[{text}]({url.replace(')', '%29')})"
+
+
+def _wrap(mark: str, inner: str) -> str:
+    """Wrap in markdown marks, keeping edge spaces outside (`** x**` doesn't render)."""
+    core = inner.strip()
+    if not core:
+        return inner
+    lead = inner[:len(inner) - len(inner.lstrip())]
+    trail = inner[len(inner.rstrip()):]
+    return f"{lead}{mark}{core}{mark}{trail}"
+
+
+def steam_markup_to_md(raw: str) -> tuple:
+    """Convert a Steam post to Discord markdown.
+
+    Returns (markdown, [image urls found in the post], youtube video id or None).
+    Headings come out wrapped in _HEAD_OPEN/_HEAD_CLOSE so they can be split off.
+    """
+    t = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = html.unescape(t)
+    t = re.sub(rf"\\+(?=\[/?(?:{_BBCODE_TAGS}|\*)(?:[= ][^\]]*)?\])", "", t)   # "\[list]" is still a tag
+    t = t.replace("\\[", "\x03").replace("\\]", "\x04")        # other escaped brackets are literal text
+    t = re.sub(r"\[[^\]\n]*\Z", "", t)                         # tag cut in half by Steam's length limit
+
+    # [noparse] keeps its brackets as plain text
+    t = re.sub(r"\[noparse\](.*?)\[/noparse\]",
+               lambda m: m.group(1).replace("[", "\x03").replace("]", "\x04"),
+               t, flags=re.I | re.S)
+
+    # Images: remember them (first one becomes the banner), remove from the text.
+    images: list = []
+
+    def grab(src: str) -> str:
+        src = (src or "").strip().strip('"\'')
+        src = re.sub(r"\{STEAM_CLAN(?:_LOC)?_IMAGE\}/?", STEAM_CLAN_IMAGE, src)
+        if src.startswith("//"):
+            src = "https:" + src
+        if src.startswith(("https://", "http://")):
+            images.append(src)
+        return ""
+
+    t = re.sub(r"\[img\](.*?)\[/img\]", lambda m: grab(m.group(1)), t, flags=re.I | re.S)
+    t = re.sub(r"\[img\s[^\]]*?src=\"([^\"]+)\"[^\]]*\](?:\s*\[/img\])?",
+               lambda m: grab(m.group(1)), t, flags=re.I)
+
+    # YouTube previews: keep the id (used as a banner fallback), drop the tag.
+    video = re.search(r"\[previewyoutube=([\w-]{6,20})", t, flags=re.I)
+    video_id = video.group(1) if video else None
+    t = re.sub(r"\[previewyoutube=[^\]]*\](?:\s*\[/previewyoutube\])?", "", t, flags=re.I)
+
+    # Code
+    def code(m):
+        body = m.group(1).strip("\n")
+        if "\n" in body:
+            return "\n```\n" + body.replace("```", "'''") + "\n```\n"
+        return "`" + body.replace("`", "'") + "`"
+    t = re.sub(r"\[code\](.*?)\[/code\]", code, t, flags=re.I | re.S)
+
+    # Headings → marker lines (bold/italic tags inside them are dropped)
+    def heading(m):
+        text = re.sub(r"\[/?[a-z]+\]", "", m.group(2), flags=re.I).replace("**", "")
+        text = " ".join(text.split())
+        return f"\n\n{_HEAD_OPEN}{text}{_HEAD_CLOSE}\n" if text else "\n"
+    t = re.sub(r"\[h([1-6])\](.*?)\[/h\1\]", heading, t, flags=re.I | re.S)
+
+    # Lists (nested lists get indented)
+    depth = 0
+
+    def list_tag(m):
+        nonlocal depth
+        closing, tag = m.group(1), m.group(2).lower()
+        if tag == "*":
+            if closing:
+                return ""
+            return "\n" + "\u2003" * max(depth - 1, 0) + ("▸ " if depth <= 1 else "◦ ")
+        if closing:
+            depth = max(depth - 1, 0)
+        else:
+            depth += 1
+        return "\n"
+    t = re.sub(r"\[(/?)(list|olist|\*)\]", list_tag, t, flags=re.I)
+
+    # Paragraphs, breaks, rules, quotes, tables
+    t = re.sub(r"\[/p\]", "\n\n", t, flags=re.I)
+    t = re.sub(r"\[p\]", "", t, flags=re.I)
+    t = re.sub(r"\[(?:br|hr)\s*/?\]", "\n\n", t, flags=re.I)
+
+    def quote(m):
+        author = (m.group(1) or "").strip()
+        lines = [l.strip() for l in m.group(2).strip().split("\n") if l.strip()]
+        if author:
+            lines.insert(0, f"**{author}**")
+        return "\n\n" + "\n".join("> " + l for l in lines) + "\n\n"
+    t = re.sub(r"\[quote(?:=([^\]]*))?\](.*?)\[/quote\]", quote, t, flags=re.I | re.S)
+
+    t = re.sub(r"\[/t[dh]\]", "  ·  ", t, flags=re.I)
+    t = re.sub(r"\[/?(?:tr|table)[^\]]*\]", "\n", t, flags=re.I)
+    t = re.sub(r"[ ]*·[ ]*(?=\n|\Z)", "", t)
+
+    # Inline styles
+    t = re.sub(r"\[b\](.*?)\[/b\]", lambda m: _wrap("**", m.group(1)), t, flags=re.I | re.S)
+    t = re.sub(r"\[i\](.*?)\[/i\]", lambda m: _wrap("*", m.group(1)), t, flags=re.I | re.S)
+    t = re.sub(r"\[u\](.*?)\[/u\]", lambda m: _wrap("__", m.group(1)), t, flags=re.I | re.S)
+    t = re.sub(r"\[(strike|s)\](.*?)\[/\1\]", lambda m: _wrap("~~", m.group(2)), t, flags=re.I | re.S)
+    t = re.sub(r"\[spoiler\](.*?)\[/spoiler\]", lambda m: _wrap("||", m.group(1)), t, flags=re.I | re.S)
+
+    # Links become clickable masked links
+    t = re.sub(r"\[url=\"?([^\]\"\s]+)\"?\](.*?)\[/url\]",
+               lambda m: _md_link(m.group(2), m.group(1)), t, flags=re.I | re.S)
+    t = re.sub(r"\[url\](.*?)\[/url\]", lambda m: _md_link(m.group(1), m.group(1)), t, flags=re.I | re.S)
+
+    # Anything BBCode left over (but NOT things like "[Fixed]" typed by the devs)
+    t = re.sub(rf"\[/?(?:{_BBCODE_TAGS})(?:[= ][^\]]*)?\]", "", t, flags=re.I)
+    t = re.sub(r"\{STEAM_CLAN(?:_LOC)?_IMAGE\}\S*", "", t)
+    t = t.replace("\x03", "[").replace("\x04", "]")
+
+    # Tidy up
+    t = re.sub(r"(?m)^[ \t]*\\+(?=\S)", "", t)           # stray leading backslashes
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t, images, video_id
+
+
+def clean_contents(text: str, limit: int = 3500) -> str:
+    """Kept for compatibility: Steam BBCode -> readable markdown text."""
+    md, _, _ = steam_markup_to_md(text)
+    md = md.replace(_HEAD_OPEN, "**").replace(_HEAD_CLOSE, "**")
+    return _tidy(md, limit)
+
+
+def _clip(text: str, limit: int) -> str:
+    """Shorten at a line/word boundary and close any markdown left open."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:max(limit - 2, 1)]
+    nl = cut.rfind("\n")
+    if nl >= len(cut) * 0.6:
+        cut = cut[:nl]
     else:
-        description = _tidy(description, 3800)
+        sp = cut.rfind(" ")
+        if sp >= len(cut) * 0.6:
+            cut = cut[:sp]
+    broken_link = re.search(r"\[[^\]]*\Z|\[[^\]]*\]\([^)]*\Z", cut)
+    if broken_link:
+        cut = cut[:broken_link.start()]
+    cut = cut.rstrip(" ,;:-\n\u2003")
+    if cut.count("```") % 2:
+        cut += "\n```"
+    for mark in ("**", "__", "~~", "||"):
+        if cut.count(mark) % 2:
+            cut += mark
+    return cut + " …"
 
-    source = item.get("source") or game
-    embed = discord.Embed(
-        title=f"◈  {title}",
-        url=item.get("url") or None,
-        description=description or "**Update detected.** Open the source link for the full report.",
-        color=EMBED_COLOR,
-    )
-    embed.set_author(name=f"VAULTBOT  //  {source.upper()[:240]}")
 
-    # Optional metadata is shown as compact dashboard-style fields.
-    if item.get("version"):
-        embed.add_field(name="▣  VERSION", value=f"`{str(item['version'])[:100]}`", inline=True)
-    if item.get("status"):
-        embed.add_field(name="◉  STATUS", value=str(item["status"])[:100], inline=True)
-    if item.get("platform"):
-        embed.add_field(name="⌘  PLATFORM", value=str(item["platform"])[:100], inline=True)
+def _split_sections(md: str) -> tuple:
+    """Split markdown into (intro, [(heading, body), ...]) at heading lines."""
+    intro: list = []
+    sections: list = []
+    current = intro
+    for line in md.split("\n"):
+        s = line.strip()
+        head = None
+        if s.startswith(_HEAD_OPEN) and s.endswith(_HEAD_CLOSE):
+            head = s[1:-1].strip()
+        else:
+            m = re.fullmatch(r"\*\*([^*]{2,80}?)\*\*:?", s)      # a line that is only bold = a heading
+            if m:
+                head = m.group(1).strip()
+        if head:
+            current = []
+            sections.append((head, current))
+        else:
+            current.append(line)
+    merged: list = []
+    pending = ""
+    for h, b in sections:
+        body = "\n".join(b).strip()
+        if not body:
+            pending = f"{pending} › {h}" if pending else h        # "Coming Up › Contests"
+            continue
+        merged.append((f"{pending} › {h}" if pending else h, body))
+        pending = ""
+    return "\n".join(intro).strip(), merged
 
-    image = item.get("image")
-    if image and str(image).startswith(("https://", "http://")):
-        embed.set_image(url=image)
-    elif appid.isdigit():
-        embed.set_thumbnail(url=STEAM_HEADER_URL.format(appid=appid))
-    elif item.get("thumbnail") and str(item["thumbnail"]).startswith(("https://", "http://")):
-        embed.set_thumbnail(url=item["thumbnail"])
 
-    footer = item.get("footer") or "PATCH INTELLIGENCE  •  VAULTBOT SYSTEMS"
-    embed.set_footer(text=f"⬡ {footer}  //  LIVE UPDATE FEED")
+# ── Update type → label, glyph and neon accent colour ────────────────────────
+_KINDS = (
+    ("HOTFIX",      "▲", (255, 77, 77),
+     r"hot\s?-?fix|emergency|roll\s?back|maintenance|downtime|outage|server (?:issue|problem)|incident"),
+    ("PATCH NOTES", "⬢", (0, 225, 255),
+     r"patch|update|changelog|change log|release notes|bug ?fix|fixes|build \d"),
+    ("SALE",        "◆", (255, 64, 200),
+     r"\bsale\b|% off|discount|free weekend|bundle|\bdeals?\b|steam (?:summer|winter|autumn|spring|next)"),
+    ("RELEASE",     "◉", (57, 255, 140),
+     r"\blaunch|\breleas(?:e|ed|ing)\b|out now|available now|now live|early access|\b1\.0\b"),
+    ("EVENT",       "✦", (176, 96, 255),
+     r"event|season|festival|weekly|community|contest|showcase|stream|dev ?log|interview|spotlight|"
+     r"tournament|giveaway|anniversary|roadmap"),
+)
+_KIND_DEFAULT = ("NEWS", "◈", (60, 150, 255))
+
+
+def _classify(title: str) -> tuple:
+    low = (title or "").lower()
+    for label, glyph, rgb, pattern in _KINDS:
+        if re.search(pattern, low):
+            return label, glyph, discord.Color.from_rgb(*rgb)
+    label, glyph, rgb = _KIND_DEFAULT
+    return label, glyph, discord.Color.from_rgb(*rgb)
+
+
+# ── Game artwork (newer Steam games use hashed header URLs, so ask Steam) ───
+_art_cache: dict = {}
+
+
+async def _steam_art(appid: str) -> Optional[str]:
+    """Banner image for a Steam app, or None for non-Steam feeds."""
+    if not str(appid).isdigit():
+        return None
+    if appid in _art_cache:
+        return _art_cache[appid]
+    url = STEAM_HEADER_URL.format(appid=appid)
     try:
-        embed.timestamp = datetime.fromtimestamp(int(item["date"]), tz=timezone.utc)
+        payload = await _get_json(STEAM_DETAILS_URL, {"appids": appid, "filters": "basic"})
+        data = ((payload or {}).get(appid) or {}).get("data") or {}
+        header = data.get("header_image")
+        if isinstance(header, str) and header.startswith("http"):
+            url = header
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, AttributeError, TypeError):
+        return url                      # don't cache a failed lookup
+    if len(_art_cache) > 200:
+        _art_cache.clear()
+    _art_cache[appid] = url
+    return url
+
+
+def _post_url(appid: str, item: dict) -> Optional[str]:
+    """Canonical Steam news link for the post (falls back to whatever the feed gave)."""
+    gid = str(item.get("gid") or "")
+    if str(appid).isdigit() and gid.isdigit():
+        return f"https://store.steampowered.com/news/app/{appid}/view/{gid}"
+    url = item.get("url")
+    return url if url and str(url).startswith(("https://", "http://")) else None
+
+
+EMBED_TOTAL_BUDGET = 5600       # Discord's hard limit is 6000 characters per embed
+MAX_SECTION_FIELDS = 10
+
+
+def build_embed(appid: str, game: str, item: dict, art: Optional[str] = None) -> discord.Embed:
+    """Cyber-style update card: type chips, summary quote, one field per section, banner."""
+    raw_title = (item.get("title") or "UPDATE DETECTED").strip()
+    kind, glyph, color = _classify(raw_title)
+    if isinstance(item.get("color"), int):
+        color = discord.Color(item["color"])
+
+    # 1) Get clean markdown (+ banner candidates) out of the source text.
+    contents = (item.get("contents") or "").strip()
+    images: list = []
+    video_id = None
+    if item.get("plain"):
+        md = _tidy(contents, 20000)
+    else:
+        md, images, video_id = steam_markup_to_md(contents)
+    intro, sections = _split_sections(md)
+
+    is_steam = str(appid).isdigit()
+    source = (item.get("source") or game or "").strip()
+    url = _post_url(appid, item)
+    try:
+        stamp = int(item["date"])
+        posted = datetime.fromtimestamp(stamp, tz=timezone.utc)
     except (KeyError, TypeError, ValueError, OSError):
-        embed.timestamp = datetime.now(timezone.utc)
+        stamp, posted = int(time.time()), datetime.now(timezone.utc)
+
+    # 2) Header strip: type chip, source chip, live "x minutes ago".
+    origin = f"STEAM  //  APP {appid}" if is_steam else (game or source).upper()[:40]
+    strip = f"`{glyph} {kind}`  `⬡ {origin}`  ◷ <t:{stamp}:R>\n▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱"
+
+    footer_name = item.get("footer") or (
+        "STEAM NEWS  •  VAULTBOT SYSTEMS" if is_steam else "PATCH INTELLIGENCE  •  VAULTBOT SYSTEMS")
+    footer_text = f"⬡ {footer_name}  //  LIVE UPDATE FEED"[:2048]
+    title = f"{glyph}  {raw_title}"[:256]
+    author = f"VAULTBOT  //  {source.upper()}"[:256]
+
+    embed_fields: list = []
+    truncated = False
+
+    # Optional metadata from non-Steam feeds, shown as compact dashboard fields.
+    for label, key, wrap in (("▣  VERSION", "version", "`{}`"),
+                             ("◉  STATUS", "status", "{}"),
+                             ("⌘  PLATFORM", "platform", "{}")):
+        if item.get(key):
+            embed_fields.append((label, wrap.format(str(item[key])[:100]), True))
+
+    # 3) Description + section fields, kept inside Discord's 6000-character cap.
+    used = len(title) + len(author) + len(footer_text) + sum(len(n) + len(v) for n, v, _ in embed_fields)
+    reserve = 160                                           # room for the "more" field
+    if sections:
+        quote = ""
+        if intro:
+            paragraphs = intro.split("\n\n")
+            if len(intro) <= 650 and not intro.startswith(("▸", "◦")):
+                quote = intro                                    # short prose intro: show it all
+            elif not paragraphs[0].startswith(("▸", "◦")):
+                quote = _clip(paragraphs[0], 650)                # long intro: lead paragraph here...
+                rest = "\n\n".join(paragraphs[1:]).strip()
+                if rest:
+                    sections = [("OVERVIEW", rest)] + list(sections)
+                elif quote != paragraphs[0]:
+                    sections = [("OVERVIEW", paragraphs[0])] + list(sections)
+            else:
+                sections = [("OVERVIEW", intro)] + list(sections)  # intro that is a bullet list: its own field
+        description = strip + (
+            "\n\n" + "\n".join("> " + l if l.strip() else ">" for l in quote.split("\n")) if quote else "")
+        used += len(description)
+        for i, (name, body) in enumerate(sections):
+            field_name = f"▸  {name.upper()}"[:256]
+            room = EMBED_TOTAL_BUDGET - used - reserve - len(field_name)
+            if len([f for f in embed_fields if not f[2]]) >= MAX_SECTION_FIELDS or room < 120:
+                truncated = True
+                break
+            value = _clip(body, min(1000, room))
+            if value != body:
+                truncated = True
+            embed_fields.append((field_name, value, False))
+            used += len(field_name) + len(value)
+    else:
+        room = min(3900, EMBED_TOTAL_BUDGET - used - reserve - len(strip) - 4)
+        body = _clip(md, room) if md else ""
+        if body != md:
+            truncated = True
+        description = strip + "\n\n" + (
+            body or "**Update detected.** Open the full report for the details.")
+
+    if truncated and url:
+        embed_fields.append(("⋯  MORE IN THE FULL REPORT",
+                             "Some of this post was trimmed to fit. Press **OPEN FULL REPORT** below.", False))
+
+    embed = discord.Embed(title=title, url=url, description=description[:4096], color=color)
+    embed.set_author(name=author, url=f"https://store.steampowered.com/app/{appid}" if is_steam else None)
+    for name, value, inline in embed_fields:
+        embed.add_field(name=name, value=value, inline=inline)
+
+    # 4) Banner: the feed's own image > the post's first image > video thumbnail > game art.
+    #    (A big image, not a thumbnail: a thumbnail squeezes all the text into a narrow column.)
+    banner = item.get("image")
+    if not (banner and str(banner).startswith(("https://", "http://"))):
+        banner = images[0] if images else None
+    if not banner and video_id:
+        banner = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    if not banner and is_steam:
+        banner = art or STEAM_HEADER_URL.format(appid=appid)
+    if not banner and item.get("thumbnail") and str(item["thumbnail"]).startswith(("https://", "http://")):
+        banner = item["thumbnail"]
+    if banner:
+        embed.set_image(url=banner)
+
+    embed.set_footer(text=footer_text)
+    embed.timestamp = posted
     return embed
 
+
+def build_view(appid: str, item: dict) -> Optional[discord.ui.View]:
+    """Link buttons under the embed (they need no handlers, so no persistence worries)."""
+    view = discord.ui.View(timeout=None)
+    url = _post_url(appid, item)
+    if url:
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="▶  OPEN FULL REPORT", url=url))
+    if str(appid).isdigit():
+        view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="◈  STORE PAGE",
+                                        url=f"https://store.steampowered.com/app/{appid}"))
+    return view if view.children else None
+
+
 async def _send(channel_id: int, embed: discord.Embed,
-                role_id: Optional[int] = None, note: Optional[str] = None) -> None:
+                role_id: Optional[int] = None, note: Optional[str] = None,
+                view: Optional[discord.ui.View] = None) -> None:
     channel = _bot.get_channel(channel_id) or await _bot.fetch_channel(channel_id)
     content = note
     mentions = discord.AllowedMentions.none()
     if role_id:
         content = f"<@&{role_id}>" + (f" {note}" if note else "")
         mentions = discord.AllowedMentions(roles=[discord.Object(id=int(role_id))])
-    await channel.send(content=content, embed=embed, allowed_mentions=mentions)
+    kwargs = {"content": content, "embed": embed, "allowed_mentions": mentions}
+    if view is not None:
+        kwargs["view"] = view
+    await channel.send(**kwargs)
 
 
 # -----------------------------------------------------------------------------
@@ -3507,11 +3851,12 @@ async def poll_once() -> None:
         fresh.sort(key=lambda i: int(i.get("date") or 0))      # oldest first
         fresh = fresh[-MAX_POSTS_PER_POLL:]
 
+        art = await _steam_art(appid)            # game banner (None for non-Steam feeds)
         for guild_id, sub in subscribers:
             for item in fresh:
                 try:
-                    await _send(int(sub["channel_id"]), build_embed(appid, sub["name"], item),
-                                role_id=sub.get("role_id"))
+                    await _send(int(sub["channel_id"]), build_embed(appid, sub["name"], item, art),
+                                role_id=sub.get("role_id"), view=build_view(appid, item))
                     print(f"[PatchNotes] Posted '{item.get('title', '')[:60]}' ({sub['name']}) in server {guild_id}.")
                 except (discord.HTTPException, ValueError, TypeError, AttributeError) as exc:
                     print(f"[PatchNotes] Couldn't post for {sub['name']} in server {guild_id}: {exc}")
@@ -3589,8 +3934,10 @@ async def _subscribe(interaction: discord.Interaction, key: str, name: str, item
     _save()
 
     try:   # show the newest post once, so you can see exactly how alerts will look
-        await _send(target.id, build_embed(key, name, items[0]),
-                    note=f"✅ Updates for **{name}** will post here. Latest one, as a preview:")
+        art = await _steam_art(key)
+        await _send(target.id, build_embed(key, name, items[0], art),
+                    note=f"✅ Updates for **{name}** will post here. Latest one, as a preview:",
+                    view=build_view(key, items[0]))
     except discord.HTTPException as exc:
         await interaction.followup.send(
             f"Saved, but I couldn't post in {target.mention}: {exc}", ephemeral=True)
