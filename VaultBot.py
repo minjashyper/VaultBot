@@ -2985,7 +2985,7 @@ MAX_GAMES_PER_SERVER = 25     # keeps one server from creating endless lookups
 MAX_POSTS_PER_POLL = 3        # if a game posts a burst of news, only send the newest few
 MAX_AGE_DAYS = 14             # never announce posts older than this (prevents old-news floods)
 SEEN_HISTORY = 100            # how many post IDs to remember per game
-EMBED_COLOR = discord.Color.from_rgb(102, 192, 244)
+EMBED_COLOR = discord.Color.from_rgb(0, 225, 255)  # VaultBot neon-cyan sci-fi accent
 
 
 def _poll_minutes() -> int:
@@ -3144,29 +3144,46 @@ def _parse_date(value) -> int:
 
 
 def build_embed(appid: str, game: str, item: dict) -> discord.Embed:
-    title = (item.get("title") or "New update").strip()[:256]
-    if item.get("plain"):            # already cleaned by a non-Steam source
-        description = (item.get("contents") or "")[:3800]
+    """Build a polished, information-rich cyber-style update card."""
+    title = (item.get("title") or "UPDATE DETECTED").strip()[:256]
+    description = (item.get("contents") or "").strip()
+    if not item.get("plain"):
+        description = clean_contents(description, 3800)
     else:
-        description = clean_contents(item.get("contents", ""))
+        description = _tidy(description, 3800)
+
+    source = item.get("source") or game
     embed = discord.Embed(
-        title=title,
+        title=f"◈  {title}",
         url=item.get("url") or None,
-        description=description or None,
+        description=description or "**Update detected.** Open the source link for the full report.",
         color=EMBED_COLOR,
     )
-    embed.set_author(name=game[:256])
-    if item.get("image"):
-        embed.set_thumbnail(url=item["image"])
+    embed.set_author(name=f"VAULTBOT  //  {source.upper()[:240]}")
+
+    # Optional metadata is shown as compact dashboard-style fields.
+    if item.get("version"):
+        embed.add_field(name="▣  VERSION", value=f"`{str(item['version'])[:100]}`", inline=True)
+    if item.get("status"):
+        embed.add_field(name="◉  STATUS", value=str(item["status"])[:100], inline=True)
+    if item.get("platform"):
+        embed.add_field(name="⌘  PLATFORM", value=str(item["platform"])[:100], inline=True)
+
+    image = item.get("image")
+    if image and str(image).startswith(("https://", "http://")):
+        embed.set_image(url=image)
     elif appid.isdigit():
         embed.set_thumbnail(url=STEAM_HEADER_URL.format(appid=appid))
-    embed.set_footer(text=item.get("footer") or "Steam • patch notes")
+    elif item.get("thumbnail") and str(item["thumbnail"]).startswith(("https://", "http://")):
+        embed.set_thumbnail(url=item["thumbnail"])
+
+    footer = item.get("footer") or "PATCH INTELLIGENCE  •  VAULTBOT SYSTEMS"
+    embed.set_footer(text=f"⬡ {footer}  //  LIVE UPDATE FEED")
     try:
         embed.timestamp = datetime.fromtimestamp(int(item["date"]), tz=timezone.utc)
     except (KeyError, TypeError, ValueError, OSError):
-        pass
+        embed.timestamp = datetime.now(timezone.utc)
     return embed
-
 
 async def _send(channel_id: int, embed: discord.Embed,
                 role_id: Optional[int] = None, note: Optional[str] = None) -> None:
@@ -3228,19 +3245,35 @@ async def _fetch_nvidia() -> list:
         raise ValueError(f"unexpected NVIDIA reply ({exc})")
     if not version:
         raise ValueError("NVIDIA reply had no driver version")
-    lines = [f"**Version:** {version}"]
+    lines = [
+        "**▰ DRIVER PACKAGE DETECTED**",
+        "A new GeForce driver package is available for your system.",
+        "",
+        f"**Driver build**  `{version}`",
+    ]
     if released:
-        lines.append(f"**Released:** {released}")
-    lines.append("Get it from the NVIDIA App or nvidia.com/drivers.")
+        lines.append(f"**Release date**  {released}")
+    lines += [
+        "",
+        "**WHAT'S INSIDE**",
+        "NVIDIA's lookup response provides version and release metadata, but not the full release-note/change list. I won't invent fixes or game optimizations.",
+        "",
+        f"**NEXT STEP**  [Open NVIDIA's driver details]({details})" if details else "**NEXT STEP**  Open the NVIDIA App or [NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx).",
+    ]
     return [{
         "gid": version,
-        "title": f"{name} {version}",
-        "url": details,
+        "title": f"GEFORCE DRIVER // {version}",
+        "url": details or "https://www.nvidia.com/Download/index.aspx",
         "date": _parse_date(released),
         "contents": "\n".join(lines),
         "plain": True,
         "image": None,
-        "footer": "NVIDIA • driver update",
+        "thumbnail": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/geforce-rtx-40-series/geforce-rtx-40-series-og-1200x630.jpg",
+        "version": version,
+        "status": "NEW DRIVER",
+        "platform": "GEFORCE / WINDOWS",
+        "footer": "NVIDIA GEFORCE • DRIVER INTEL",
+        "source": "NVIDIA DRIVER INTELLIGENCE",
     }]
 
 
@@ -3254,23 +3287,55 @@ async def _fetch_fortnite() -> list:
     version = found.group(1) if found else build
     if not version:
         raise ValueError("Fortnite reply had no build")
+
+    # Fortnite's public news endpoint provides actual Battle Royale news items;
+    # if it is unavailable, keep the build alert honest and link to Epic's site.
+    lines = [
+        "**◈ LIVE BUILD SIGNAL ACQUIRED**",
+        f"Fortnite build `{version}` has been detected by the update monitor.",
+    ]
+    image = None
+    news_url = FORTNITE_NEWS_PAGE
+    try:
+        news_payload = await _get_json("https://fortnite-api.com/v2/news", {"language": "en"})
+        data = news_payload.get("data") or {}
+        br = data.get("br") or {}
+        motds = br.get("motds") or []
+        if motds:
+            lines += ["", "**▰ BATTLE ROYALE INTEL**"]
+            for entry in motds[:4]:
+                if not isinstance(entry, dict):
+                    continue
+                headline = str(entry.get("title") or entry.get("tabTitle") or "Update")
+                body = re.sub(r"<[^>]+>", "", str(entry.get("body") or ""))
+                body = html.unescape(re.sub(r"\s+", " ", body)).strip()
+                lines.append(f"**{headline[:150]}**")
+                if body:
+                    lines.append(body[:650])
+                lines.append("")
+                image = image or entry.get("image") or entry.get("tileImage")
+            lines.append("*News items are supplied by the public Fortnite news feed; availability can vary by mode/region.*")
+        else:
+            lines += ["", "The public news feed did not return current Battle Royale headlines. Open Epic's official news page for the published notes."]
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError):
+        lines += ["", "**PATCH INTEL UNAVAILABLE**  The public news feed could not be read right now. Open Epic's official news page for the published notes."]
+
+    if image and not str(image).startswith(("https://", "http://")):
+        image = None
     return [{
         "gid": version,
-        "title": f"Fortnite v{version} is live",
-        "url": FORTNITE_NEWS_PAGE,
+        "title": f"FORTNITE // BUILD {version}",
+        "url": news_url,
         "date": int(time.time()),
-        "contents": (
-            f"**Detected build:** `{version}`\n\n"
-            "VaultBot detected a new Fortnite build. The build-check endpoint does "
-            "not include the actual change list, so this alert cannot reliably list "
-            "new weapons, balance changes, map changes, or bug fixes yet. Open the "
-            "official Fortnite news link for Epic's published details."
-        ),
+        "contents": "\n".join(lines)[:3800],
         "plain": True,
-        "image": None,
-        "footer": "Fortnite • update detected",
+        "image": image,
+        "version": version,
+        "status": "BUILD DETECTED",
+        "platform": "FORTNITE / LIVE SERVICE",
+        "footer": "FORTNITE • LIVE PATCH INTELLIGENCE",
+        "source": "FORTNITE LIVE OPS",
     }]
-
 
 FEEDS = {
     "feed:minecraft_java": ("Minecraft: Java Edition", lambda: _fetch_minecraft("java")),
