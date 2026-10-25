@@ -2360,6 +2360,517 @@ async def clear_messages_error(ctx: commands.Context, error: commands.CommandErr
 
 
 # =============================================================================
+# 12b. FREESTUFF FREE-GAME ALERTS (webhook receiver + settings panel)
+# =============================================================================
+# FreeStuff sends signed webhooks to a small HTTP server that runs next to the
+# bot. Every server picks its own alert channel, ping, stores/launchers and
+# free-game types with the /freestuff panel. If FREESTUFF_PUBLIC_KEY is missing
+# or pynacl isn't installed, the webhook stays off, but the panel still works
+# and the rest of VaultBot keeps running.
+import base64
+import binascii
+from collections import OrderedDict
+
+from aiohttp import web
+
+try:
+    from nacl.exceptions import BadSignatureError
+    from nacl.signing import VerifyKey
+    _NACL_AVAILABLE = True
+except ImportError:
+    _NACL_AVAILABLE = False
+
+FREESTUFF_PUBLIC_KEY = os.getenv("FREESTUFF_PUBLIC_KEY", "").strip()
+# A separate variable from PORT, which many hosts set for their own use.
+FREESTUFF_PORT = _positive_int_env("FREESTUFF_PORT", 3000)
+FREESTUFF_WEBHOOK_PATH = (
+    os.getenv("FREESTUFF_WEBHOOK_PATH", "/freestuff/webhook").strip() or "/freestuff/webhook"
+)
+# Saved per-server panel choices. Stored next to VaultBot.py unless overridden.
+FREESTUFF_SETTINGS_FILE = Path(os.getenv(
+    "FREESTUFF_SETTINGS_FILE",
+    str(Path(__file__).resolve().parent / "freestuff_settings.json"),
+))
+
+# Stores/launchers a server can pick. FreeStuff may add stores later; unknown
+# ones are treated as "other".
+FREESTUFF_STORE_CHOICES = {
+    "steam": "Steam",
+    "epic": "Epic Games Store",
+    "gog": "GOG",
+    "humble": "Humble Bundle",
+    "origin": "EA App / Origin",
+    "ubi": "Ubisoft Connect",
+    "itch": "itch.io",
+    "prime": "Prime Gaming",
+    "other": "Other stores",
+}
+# Channel values from FreeStuff's product types.
+FREESTUFF_TYPE_CHOICES = {
+    "keep": "Free to keep (100% off)",
+    "timed": "Free weekends & trials",
+    "prime": "Prime Gaming games",
+    "gamepass": "Xbox Game Pass",
+    "other": "DLC & extra content",
+}
+FREESTUFF_DEFAULTS = {
+    "channel_id": None,
+    "ping": "none",       # none | everyone | role
+    "role_id": None,
+    "stores": list(FREESTUFF_STORE_CHOICES),
+    "types": ["keep", "timed"],
+}
+
+FREESTUFF_EPOCH_MS = 1735689600000  # FreeStuff timestamps count seconds from 2025-01-01
+FREESTUFF_MAX_AGE_SECONDS = 300
+_FS_FLAG_TRASH = 1 << 0
+_FS_IMG_WIDE = 1 << 1
+_FS_COLOR = discord.Color.from_rgb(46, 204, 113)
+
+_freestuff_guilds: dict[str, dict] = {}  # server ID (as text) -> saved settings
+_freestuff_seen: OrderedDict = OrderedDict()  # message IDs already handled (replay protection)
+_freestuff_tasks: set = set()
+_freestuff_key = None
+_freestuff_started = False
+
+
+# ---------- saved settings ----------
+
+def _load_freestuff_settings() -> None:
+    try:
+        data = json.loads(FREESTUFF_SETTINGS_FILE.read_text(encoding="utf-8"))
+        guilds = data.get("guilds") if isinstance(data, dict) else None
+        if isinstance(guilds, dict):
+            _freestuff_guilds.update(
+                {str(k): v for k, v in guilds.items() if isinstance(v, dict)}
+            )
+        print(f"[FreeStuff] Loaded alert settings for {len(_freestuff_guilds)} server(s).")
+    except FileNotFoundError:
+        print("[FreeStuff] No saved alert settings yet. Use /freestuff to set them up.")
+    except (OSError, ValueError) as exc:
+        print(f"[FreeStuff] Could not read {FREESTUFF_SETTINGS_FILE.name}: {exc}")
+
+
+def _save_freestuff_settings() -> None:
+    """Write atomically so a crash mid-save can't corrupt the file."""
+    FREESTUFF_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = FREESTUFF_SETTINGS_FILE.with_name(FREESTUFF_SETTINGS_FILE.name + ".tmp")
+    temp.write_text(json.dumps({"guilds": _freestuff_guilds}, indent=2), encoding="utf-8")
+    temp.replace(FREESTUFF_SETTINGS_FILE)
+
+
+def _fs_get(guild_id: int) -> dict:
+    """Settings for one server, with defaults filled in."""
+    settings = {**FREESTUFF_DEFAULTS, **_freestuff_guilds.get(str(guild_id), {})}
+    settings["stores"] = [k for k in FREESTUFF_STORE_CHOICES if k in settings["stores"]]
+    settings["types"] = [k for k in FREESTUFF_TYPE_CHOICES if k in settings["types"]]
+    return settings
+
+
+def _fs_update(guild_id: int, **changes) -> None:
+    settings = _fs_get(guild_id)
+    settings.update(changes)
+    _freestuff_guilds[str(guild_id)] = settings
+    try:
+        _save_freestuff_settings()
+    except OSError as exc:
+        print(f"[FreeStuff] Could not save settings: {exc}")
+
+
+# ---------- webhook verification ----------
+
+def _load_freestuff_key(raw: str):
+    """Accept the Ed25519 public key as hex or base64."""
+    raw = raw.removeprefix("whpk_")
+    try:
+        key_bytes = bytes.fromhex(raw)
+    except ValueError:
+        key_bytes = base64.b64decode(raw + "=" * (-len(raw) % 4))
+    return VerifyKey(key_bytes)
+
+
+def _verify_freestuff_request(msg_id, timestamp, signature_header, body, verify_key) -> bool:
+    """Check the Standard Webhooks signature and that the message is recent."""
+    try:
+        sent_ms = int(timestamp) * 1000 + FREESTUFF_EPOCH_MS
+    except (TypeError, ValueError):
+        return False
+    if abs(time.time() * 1000 - sent_ms) > FREESTUFF_MAX_AGE_SECONDS * 1000:
+        return False
+    signed = f"{msg_id}.{timestamp}.".encode() + body
+    for part in signature_header.split():
+        _, _, sig_b64 = part.partition(",")
+        try:
+            verify_key.verify(signed, base64.b64decode(sig_b64))
+            return True
+        except (BadSignatureError, ValueError):
+            continue
+    return False
+
+
+# ---------- building and sending alerts ----------
+
+def _fs_store_key(product: dict) -> str:
+    store = product.get("store")
+    return store if store in FREESTUFF_STORE_CHOICES else "other"
+
+
+def _fs_ping(settings: dict):
+    """Return (text to prepend, AllowedMentions) for the chosen ping."""
+    if settings["ping"] == "everyone":
+        return "@everyone ", discord.AllowedMentions(everyone=True)
+    if settings["ping"] == "role" and settings.get("role_id"):
+        role_id = int(settings["role_id"])
+        return f"<@&{role_id}> ", discord.AllowedMentions(roles=[discord.Object(id=role_id)])
+    return "", discord.AllowedMentions.none()
+
+
+def _build_freestuff_embed(product: dict) -> discord.Embed:
+    urls = sorted(product.get("urls") or [], key=lambda u: u.get("priority", 0), reverse=True)
+    images = sorted(
+        product.get("images") or [],
+        key=lambda i: (bool(i.get("flags", 0) & _FS_IMG_WIDE), i.get("priority", 0)),
+        reverse=True,
+    )
+
+    embed = discord.Embed(
+        title=str(product.get("title") or "Free game")[:256],
+        description=(product.get("description") or "")[:300] or None,
+        color=_FS_COLOR,
+    )
+    if urls and urls[0].get("url"):
+        embed.url = urls[0]["url"]
+    if images and images[0].get("url"):
+        embed.set_image(url=images[0]["url"])
+
+    embed.add_field(name="Store", value=FREESTUFF_STORE_CHOICES[_fs_store_key(product)], inline=True)
+    usd = next((p for p in product.get("prices") or [] if p.get("currency") == "USD"), None)
+    if usd and usd.get("oldValue"):
+        embed.add_field(name="Normally", value=f"~~${usd['oldValue'] / 100:.2f}~~ → **FREE**", inline=True)
+    if product.get("until"):
+        embed.add_field(name="Ends", value=f"<t:{int(product['until'] // 1000)}:R>", inline=True)
+    if product.get("notice"):
+        embed.add_field(name="Note", value=str(product["notice"])[:200], inline=False)
+    return embed
+
+
+def _freestuff_test_product() -> dict:
+    """Sample product for the panel's Send test button."""
+    return {
+        "title": "Test alert: this is how FreeStuff games will look",
+        "description": "This is a test message from the /freestuff panel. No real game is being offered.",
+        "store": "steam",
+        "type": "keep",
+        "prices": [],
+        "urls": [],
+        "images": [],
+        "flags": 0,
+    }
+
+
+async def _post_freestuff_alert(channel_id: int, products: list, settings: dict) -> None:
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    prefix, allowed = _fs_ping(settings)
+    for start in range(0, len(products), 10):  # Discord allows 10 embeds per message
+        await channel.send(
+            content=f"{prefix}🎮 **Free game alert!**",
+            embeds=[_build_freestuff_embed(p) for p in products[start:start + 10]],
+            allowed_mentions=allowed,
+        )
+
+
+async def _process_freestuff_event(event: dict) -> None:
+    kind = event.get("type")
+    if kind == "fsb:event:ping":
+        print("[FreeStuff] Ping received. The webhook is connected.")
+        return
+    if kind != "fsb:event:announcement_created":
+        return
+
+    products = [
+        p for p in ((event.get("data") or {}).get("resolvedProducts") or [])
+        if isinstance(p, dict) and not (p.get("flags", 0) & _FS_FLAG_TRASH)
+    ]
+    if not products:
+        return
+
+    # FreeStuff sends one webhook for everyone, so filter for each server here.
+    for guild_key in list(_freestuff_guilds):
+        settings = _fs_get(int(guild_key))
+        if not settings["channel_id"]:
+            continue
+        matches = [
+            p for p in products
+            if p.get("type") in settings["types"] and _fs_store_key(p) in settings["stores"]
+        ]
+        if not matches:
+            continue
+        try:
+            await _post_freestuff_alert(int(settings["channel_id"]), matches, settings)
+            print(f"[FreeStuff] Posted {len(matches)} game(s) in server {guild_key}.")
+        except discord.HTTPException as exc:
+            print(f"[FreeStuff] Couldn't post in server {guild_key}: {exc}")
+
+
+async def _run_freestuff_event(event: dict) -> None:
+    """Log failures so one bad event never takes down the webhook server."""
+    try:
+        await _process_freestuff_event(event)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FreeStuff] Could not process event: {exc}")
+
+
+async def _handle_freestuff_webhook(request: web.Request) -> web.Response:
+    body = await request.read()  # raw bytes are required for the signature check
+    msg_id = request.headers.get("Webhook-Id", "")
+    timestamp = request.headers.get("Webhook-Timestamp", "")
+    signature = request.headers.get("Webhook-Signature", "")
+
+    if not _verify_freestuff_request(msg_id, timestamp, signature, body, _freestuff_key):
+        return web.Response(status=401)
+
+    # Duplicate delivery (FreeStuff retries): acknowledge without posting again.
+    if msg_id in _freestuff_seen:
+        return web.Response(status=204)
+    _freestuff_seen[msg_id] = time.time()
+    while len(_freestuff_seen) > 500:
+        _freestuff_seen.popitem(last=False)
+
+    try:
+        event = json.loads(body)
+    except ValueError:
+        return web.Response(status=204)
+
+    # Reply right away so FreeStuff doesn't count the delivery as failed.
+    task = asyncio.create_task(_run_freestuff_event(event))
+    _freestuff_tasks.add(task)
+    task.add_done_callback(_freestuff_tasks.discard)
+    return web.Response(status=204)
+
+
+# ---------- the /freestuff panel ----------
+
+def _build_freestuff_panel_embed(settings: dict) -> discord.Embed:
+    if settings["channel_id"]:
+        status, channel_text = "✅ On", f"<#{settings['channel_id']}>"
+    else:
+        status, channel_text = "⛔ Off", "Not set. Pick a channel below to turn alerts on."
+
+    if settings["ping"] == "everyone":
+        ping_text = "@everyone"
+    elif settings["ping"] == "role":
+        ping_text = f"<@&{settings['role_id']}>" if settings.get("role_id") else "Role not picked yet"
+    else:
+        ping_text = "No ping"
+
+    stores = ", ".join(FREESTUFF_STORE_CHOICES[k] for k in settings["stores"]) or "None"
+    types = ", ".join(FREESTUFF_TYPE_CHOICES[k] for k in settings["types"]) or "None"
+
+    embed = discord.Embed(
+        title="🎮 FreeStuff Alerts",
+        description=f"**Status:** {status}\nChanges save right away.",
+        color=BRAND_COLOR,
+    )
+    embed.add_field(name="Channel", value=channel_text, inline=False)
+    embed.add_field(name="Ping", value=ping_text, inline=True)
+    embed.add_field(name="Stores / launchers", value=stores, inline=False)
+    embed.add_field(name="Game types", value=types, inline=False)
+    if _freestuff_key is None:
+        embed.add_field(
+            name="⚠️ Webhook",
+            value="The FreeStuff webhook isn't running on this host, so no alerts will arrive yet. Check the bot console.",
+            inline=False,
+        )
+    embed.set_footer(text="Only you can see this panel. Requires the Manage Server permission.")
+    return embed
+
+
+class FreeStuffStoreSelect(discord.ui.Select):
+    def __init__(self, selected):
+        super().__init__(
+            placeholder="Stores / launchers to alert for…",
+            min_values=1,
+            max_values=len(FREESTUFF_STORE_CHOICES),
+            options=[
+                discord.SelectOption(label=label, value=key, default=key in selected)
+                for key, label in FREESTUFF_STORE_CHOICES.items()
+            ],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.update_settings(interaction, stores=list(self.values))
+
+
+class FreeStuffTypeSelect(discord.ui.Select):
+    def __init__(self, selected):
+        super().__init__(
+            placeholder="Types of free games to post…",
+            min_values=1,
+            max_values=len(FREESTUFF_TYPE_CHOICES),
+            options=[
+                discord.SelectOption(label=label, value=key, default=key in selected)
+                for key, label in FREESTUFF_TYPE_CHOICES.items()
+            ],
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.update_settings(interaction, types=list(self.values))
+
+
+class FreeStuffPanelView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self.message: Optional[discord.Message] = None
+        settings = _fs_get(guild_id)
+        self.add_item(FreeStuffStoreSelect(settings["stores"]))
+        self.add_item(FreeStuffTypeSelect(settings["types"]))
+        self._sync_ping_buttons(settings)
+
+    def _sync_ping_buttons(self, settings: dict) -> None:
+        """Highlight the ping option that's currently active."""
+        self.ping_none.style = (
+            discord.ButtonStyle.success if settings["ping"] == "none" else discord.ButtonStyle.secondary
+        )
+        self.ping_everyone.style = (
+            discord.ButtonStyle.success if settings["ping"] == "everyone" else discord.ButtonStyle.secondary
+        )
+
+    async def update_settings(self, interaction: discord.Interaction, **changes) -> None:
+        _fs_update(self.guild_id, **changes)
+        settings = _fs_get(self.guild_id)
+        self._sync_ping_buttons(settings)
+        await interaction.response.edit_message(
+            embed=_build_freestuff_panel_embed(settings), view=self
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who opened this panel can change it. Run `/freestuff` to open your own.",
+                ephemeral=True,
+            )
+            return False
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need the **Manage Server** permission to change FreeStuff alerts.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.channel_select(
+        placeholder="Pick the channel for alerts…",
+        channel_types=[discord.ChannelType.text],
+        min_values=1,
+        max_values=1,
+        row=0,
+    )
+    async def channel_pick(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        await self.update_settings(interaction, channel_id=select.values[0].id)
+
+    @discord.ui.button(label="No ping", style=discord.ButtonStyle.secondary, row=3)
+    async def ping_none(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.update_settings(interaction, ping="none")
+
+    @discord.ui.button(label="@everyone", emoji="📢", style=discord.ButtonStyle.secondary, row=3)
+    async def ping_everyone(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.update_settings(interaction, ping="everyone")
+
+    @discord.ui.button(label="Send test", emoji="🧪", style=discord.ButtonStyle.primary, row=3)
+    async def test_alert(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = _fs_get(self.guild_id)
+        if not settings["channel_id"]:
+            await interaction.response.send_message("Pick a channel first.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            await _post_freestuff_alert(int(settings["channel_id"]), [_freestuff_test_product()], settings)
+            await interaction.followup.send("✅ Test alert sent to the channel.", ephemeral=True)
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"❌ Couldn't post there: {exc}. Check the bot's permissions in that channel.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Turn off", emoji="⛔", style=discord.ButtonStyle.danger, row=3)
+    async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.update_settings(interaction, channel_id=None)
+
+    @discord.ui.role_select(
+        placeholder="Or ping a role instead (optional)…",
+        min_values=1,
+        max_values=1,
+        row=4,
+    )
+    async def role_pick(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        await self.update_settings(interaction, ping="role", role_id=select.values[0].id)
+
+
+@bot.tree.command(
+    name="freestuff",
+    description="Choose where FreeStuff alerts go and which stores they cover",
+)
+@discord.app_commands.guild_only()
+@discord.app_commands.default_permissions(manage_guild=True)
+@discord.app_commands.checks.has_permissions(manage_guild=True)
+async def freestuff_panel(interaction: discord.Interaction):
+    view = FreeStuffPanelView(interaction.user.id, interaction.guild_id)
+    await interaction.response.send_message(
+        embed=_build_freestuff_panel_embed(_fs_get(interaction.guild_id)),
+        view=view,
+        ephemeral=True,
+    )
+    view.message = await interaction.original_response()
+
+
+@bot.listen("on_ready")
+async def _start_freestuff_alerts():
+    """Load settings and start the webhook server once. Existing on_ready is unchanged."""
+    global _freestuff_started, _freestuff_key
+    if _freestuff_started:
+        return
+    _freestuff_started = True
+    _load_freestuff_settings()
+
+    if not FREESTUFF_PUBLIC_KEY:
+        print("[FreeStuff] FREESTUFF_PUBLIC_KEY is not set; the webhook is off. The /freestuff panel still works.")
+        return
+    if not _NACL_AVAILABLE:
+        print("[FreeStuff] pynacl is not installed (pip install pynacl); the webhook is off.")
+        return
+    try:
+        _freestuff_key = _load_freestuff_key(FREESTUFF_PUBLIC_KEY)
+    except (ValueError, TypeError) as exc:
+        print(f"[FreeStuff] The public key couldn't be read ({exc}); the webhook is off.")
+        return
+
+    app = web.Application()
+    app.router.add_post(FREESTUFF_WEBHOOK_PATH, _handle_freestuff_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, "0.0.0.0", FREESTUFF_PORT).start()
+    except OSError as exc:
+        print(f"[FreeStuff] Could not open port {FREESTUFF_PORT} ({exc}); the webhook is off.")
+        await runner.cleanup()
+        return
+    print(f"[FreeStuff] Webhook server listening on port {FREESTUFF_PORT} at {FREESTUFF_WEBHOOK_PATH}")
+
+
+# =============================================================================
 # 13. STARTUP
 # =============================================================================
 if not TOKEN:
