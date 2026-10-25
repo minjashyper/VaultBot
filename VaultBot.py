@@ -3056,7 +3056,7 @@ async def _fetch_news(appid: str, count: int = 6) -> list:
     payload = await _get_json(STEAM_NEWS_URL, {
         "appid": appid,
         "count": count,
-        "maxlength": 3000,
+        "maxlength": 8000,
         "feeds": "steam_community_announcements",
         "format": "json",
     })
@@ -3102,7 +3102,7 @@ def _tidy(t: str, limit: int) -> str:
     return t
 
 
-def clean_contents(text: str, limit: int = 700) -> str:
+def clean_contents(text: str, limit: int = 3500) -> str:
     """Steam posts use BBCode ([b], [list], [img]...). Make it readable plain text."""
     t = text or ""
     t = re.sub(r"\[img\].*?\[/img\]", "", t, flags=re.I | re.S)
@@ -3116,7 +3116,7 @@ def clean_contents(text: str, limit: int = 700) -> str:
     return _tidy(t, limit)
 
 
-def html_to_text(raw: str, limit: int = 700) -> str:
+def html_to_text(raw: str, limit: int = 3500) -> str:
     """Minecraft's notes are HTML. Keep headings and bullets, drop the rest."""
     t = raw or ""
     t = re.sub(r"(?is)<(script|style).*?</\1>", "", t)
@@ -3146,7 +3146,7 @@ def _parse_date(value) -> int:
 def build_embed(appid: str, game: str, item: dict) -> discord.Embed:
     title = (item.get("title") or "New update").strip()[:256]
     if item.get("plain"):            # already cleaned by a non-Steam source
-        description = (item.get("contents") or "")[:1500]
+        description = (item.get("contents") or "")[:3800]
     else:
         description = clean_contents(item.get("contents", ""))
     embed = discord.Embed(
@@ -3259,8 +3259,13 @@ async def _fetch_fortnite() -> list:
         "title": f"Fortnite v{version} is live",
         "url": FORTNITE_NEWS_PAGE,
         "date": int(time.time()),
-        "contents": "A new Fortnite update has gone live. "
-                    "Epic posts the full patch notes on the Fortnite website (link above).",
+        "contents": (
+            f"**Detected build:** `{version}`\n\n"
+            "VaultBot detected a new Fortnite build. The build-check endpoint does "
+            "not include the actual change list, so this alert cannot reliably list "
+            "new weapons, balance changes, map changes, or bug fixes yet. Open the "
+            "official Fortnite news link for Epic's published details."
+        ),
         "plain": True,
         "image": None,
         "footer": "Fortnite • update detected",
