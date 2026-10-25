@@ -32,10 +32,13 @@ import asyncio
 import faulthandler
 import json
 import os
+import random
+import re
 import shutil
 import signal
 import sys
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -1187,6 +1190,69 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         return
     print(f"Command error: {error}")
     await ctx.send("Something went wrong while running that command. Check the bot console.")
+
+
+# ---- Random auto-replies (no command needed) ----
+# Occasionally replies to normal chat messages or image uploads. It only fires
+# when a keyword/image matches, a dice roll passes, and the channel cooldown
+# has expired. Edit the dictionaries below to change what it says.
+AUTO_REPLY_ENABLED = True
+AUTO_REPLY_CHANCE = 0.4          # chance to reply WHEN something matches (0.0 - 1.0)
+AUTO_REPLY_COOLDOWN = 60         # minimum seconds between auto-replies per channel
+
+AUTO_REPLY_KEYWORDS = {
+    ("hello", "hi", "hey", "yo"): ["Hey there!", "Yo!", "Well hello 👋"],
+    ("gm", "good morning"): ["Morning! ☀️", "gm gm"],
+    ("gn", "good night"): ["Night! 🌙", "Sleep well!"],
+    ("lol", "lmao", "haha"): ["😂", "lmaooo", "Okay that was funny"],
+    ("game", "play", "fortnite"): ["I'm down 🎮", "Count me in", "Run it"],
+}
+AUTO_REPLY_IMAGES = ["Nice pic!", "Ooh, what's this? 👀", "Saving this one 📸"]
+
+_auto_reply_last_sent: dict[int, float] = {}
+
+
+def _pick_auto_reply(message: discord.Message) -> Optional[str]:
+    """Return a reply that fits the message, or None if nothing matches."""
+    if any(
+        attachment.content_type and attachment.content_type.startswith("image/")
+        for attachment in message.attachments
+    ):
+        return random.choice(AUTO_REPLY_IMAGES)
+
+    text = message.content.lower()
+    for keywords, replies in AUTO_REPLY_KEYWORDS.items():
+        if any(re.search(rf"\b{re.escape(word)}\b", text) for word in keywords):
+            return random.choice(replies)
+    return None
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # Commands are handled normally and never get an auto-reply.
+    if message.content.startswith(PREFIX):
+        await bot.process_commands(message)
+        return
+
+    if AUTO_REPLY_ENABLED and message.guild:
+        reply = _pick_auto_reply(message)
+        now = time.time()
+        last_sent = _auto_reply_last_sent.get(message.channel.id, 0.0)
+        if (
+            reply
+            and random.random() < AUTO_REPLY_CHANCE
+            and now - last_sent > AUTO_REPLY_COOLDOWN
+        ):
+            try:
+                await message.channel.send(reply)
+                _auto_reply_last_sent[message.channel.id] = now
+            except discord.HTTPException as error:
+                print(f"[AutoReply] Could not send reply: {error}")
+
+    await bot.process_commands(message)
 
 
 # =============================================================================
