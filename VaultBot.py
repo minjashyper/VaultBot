@@ -53,6 +53,8 @@ import yt_dlp
 
 
 import html
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import timezone
 from discord import app_commands
 # =============================================================================
@@ -3322,7 +3324,7 @@ async def _fetch_fortnite() -> list:
 
     if image and not str(image).startswith(("https://", "http://")):
         image = None
-    return [{
+    items = [{
         "gid": version,
         "title": f"FORTNITE // BUILD {version}",
         "url": news_url,
@@ -3336,6 +3338,85 @@ async def _fetch_fortnite() -> list:
         "footer": "FORTNITE • LIVE PATCH INTELLIGENCE",
         "source": "FORTNITE LIVE OPS",
     }]
+
+    # HYPEX posts are added to the same Fortnite subscription/channel. The feed
+    # bridge is public; if it is temporarily unavailable, official Fortnite
+    # monitoring continues normally.
+    try:
+        items.extend(await _fetch_hypex())
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, ET.ParseError) as exc:
+        print(f"[PatchNotes] HYPEX feed unavailable; Fortnite updates still active: {exc}")
+    return items
+
+
+async def _fetch_hypex() -> list:
+    """Read recent HYPEX posts through FxTwitter's public RSS feed."""
+    url = "https://fxtwitter.com/HYPEX/feed.xml"
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {"Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, headers=headers) as resp:
+            resp.raise_for_status()
+            raw = await resp.text()
+
+    root = ET.fromstring(raw)
+    entries = root.findall(".//item")
+    if not entries:
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        entries = root.findall(".//atom:entry", ns)
+
+    items = []
+    for entry in entries[:10]:
+        def child_text(names):
+            for name in names:
+                found = entry.find(name)
+                if found is not None and found.text:
+                    return found.text.strip()
+            return ""
+
+        title = child_text(["title", "{http://www.w3.org/2005/Atom}title"]) or "HYPEX POST"
+        link = child_text(["link", "{http://www.w3.org/2005/Atom}link"])
+        if not link:
+            atom_link = entry.find("{http://www.w3.org/2005/Atom}link")
+            if atom_link is not None:
+                link = atom_link.attrib.get("href", "")
+        guid = child_text(["guid", "id", "{http://www.w3.org/2005/Atom}id"]) or link or title
+        description = child_text(["description", "{http://www.w3.org/2005/Atom}content", "{http://www.w3.org/2005/Atom}summary"])
+        description = html.unescape(description)
+        description = html_to_text(description, 3000)
+        date_text = child_text(["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}published", "{http://www.w3.org/2005/Atom}updated"])
+        try:
+            date_value = int(parsedate_to_datetime(date_text).timestamp()) if date_text else _parse_date("")
+        except (TypeError, ValueError, OverflowError):
+            date_value = _parse_date(date_text)
+
+        image = None
+        for node in entry.iter():
+            if node.tag.endswith("}content") or node.tag.endswith("}thumbnail") or node.tag == "enclosure":
+                candidate = node.attrib.get("url")
+                if candidate and candidate.startswith("https://") and any(ext in candidate.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    image = candidate
+                    break
+        if not link.startswith(("https://", "http://")):
+            link = "https://x.com/HYPEX"
+        if not description:
+            description = title
+        items.append({
+            "gid": f"hypex:{guid}",
+            "title": f"HYPEX // {title}"[:250],
+            "url": link,
+            "date": date_value,
+            "contents": f"**◈ HYPEX / LEAKS INTEL**\n{description}\n\n[OPEN ORIGINAL POST]({link})"[:3800],
+            "plain": True,
+            "image": image,
+            "status": "COMMUNITY INTEL",
+            "platform": "FORTNITE / X",
+            "footer": "HYPEX • COMMUNITY INTEL (UNOFFICIAL)",
+            "source": "HYPEX // UNOFFICIAL SOURCE",
+        })
+    items.sort(key=lambda item: int(item.get("date") or 0), reverse=True)
+    return items[:8]
+
 
 FEEDS = {
     "feed:minecraft_java": ("Minecraft: Java Edition", lambda: _fetch_minecraft("java")),
