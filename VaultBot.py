@@ -4314,6 +4314,531 @@ def install(bot: discord.Client) -> None:
 install(bot)
 
 # =============================================================================
+# 12d. TWITCH DROPS ALERTS (RSS/Atom feed + per-server settings)
+# =============================================================================
+"""
+Posts a Discord alert when a new Twitch Drops campaign appears in a feed,
+but only for the games each server chose to follow.
+
+Setup
+-----
+1. Copy the feed link from the ttvdrops site (campaigns feed) and set it on
+   your host:   DROPS_FEED_URL=https://...
+2. Restart the bot. In each server, a Manage Server member runs:
+      /drops setup channel:#drops role:@Drops     (role is optional)
+      /drops add game:Rust
+      /drops add game:all                          (follow every game)
+3. /drops status shows when the feed was last read and whether it's failing.
+
+Optional environment variables
+  DROPS_POLL_MINUTES   how often to read the feed (default 15, minimum 5)
+  DROPS_DATA_FILE      where settings are saved (default: drops_data.json next to this file)
+
+Notes
+  * The first successful read only remembers what is already in the feed, so
+    old campaigns are never dumped into your channels.
+  * If the feed fails several times in a row, the bot owner gets a DM, and
+    another one when it recovers.
+  * /drops post is the manual backup for campaigns the feed misses.
+  * Every name here starts with _drops_ / DROPS_ so it can't clash with the
+    FreeStuff or PatchNotes sections.
+"""
+
+DROPS_FEED_URL = os.getenv("DROPS_FEED_URL", "").strip()
+DROPS_POLL_MINUTES = max(5, _positive_int_env("DROPS_POLL_MINUTES", 15))
+DROPS_DATA_FILE = Path(os.getenv(
+    "DROPS_DATA_FILE",
+    str(Path(__file__).resolve().parent / "drops_data.json"),
+))
+DROPS_MAX_AGE_DAYS = 7          # never announce entries older than this
+DROPS_MAX_POSTS_PER_POLL = 10   # cap a burst of new entries
+DROPS_MAX_GAMES_PER_SERVER = 50
+DROPS_SEEN_LIMIT = 1000         # how many entry IDs to remember
+DROPS_FAIL_ALERT_AFTER = 6      # consecutive failures before the owner is DM'd
+DROPS_MAX_FEED_BYTES = 2_000_000
+DROPS_COLOR = discord.Color.from_rgb(145, 70, 255)
+_DROPS_ALL = "all"
+
+_drops_guilds: dict = {}        # server ID (text) -> {"channel_id", "role_id", "games": [..]}
+_drops_seen: list = []          # entry IDs already handled (oldest first)
+_drops_baseline = False         # True once the feed's existing entries were remembered
+_drops_started = False
+_drops_fail_count = 0
+_drops_owner_notified = False
+_drops_last_ok: Optional[int] = None
+_drops_last_error = ""
+
+
+# ---------- saved settings ----------
+
+def _drops_load() -> None:
+    global _drops_guilds, _drops_seen, _drops_baseline
+    try:
+        data = json.loads(DROPS_DATA_FILE.read_text(encoding="utf-8"))
+        guilds = data.get("guilds", {})
+        seen = data.get("seen", [])
+        if isinstance(guilds, dict) and isinstance(seen, list):
+            _drops_guilds = {str(k): v for k, v in guilds.items() if isinstance(v, dict)}
+            _drops_seen = [str(s) for s in seen]
+            _drops_baseline = bool(data.get("baseline", False))
+        print(f"[Drops] Loaded settings for {len(_drops_guilds)} server(s).")
+    except FileNotFoundError:
+        print("[Drops] No saved settings yet. Use /drops setup to create some.")
+    except (OSError, ValueError, AttributeError) as exc:
+        print(f"[Drops] Could not read {DROPS_DATA_FILE.name}: {exc}")
+        try:  # keep the unreadable file instead of overwriting it
+            DROPS_DATA_FILE.replace(DROPS_DATA_FILE.with_name(DROPS_DATA_FILE.name + ".unreadable"))
+        except OSError:
+            pass
+
+
+def _drops_save() -> None:
+    try:
+        DROPS_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = DROPS_DATA_FILE.with_name(DROPS_DATA_FILE.name + ".tmp")
+        temp.write_text(
+            json.dumps({"guilds": _drops_guilds, "seen": _drops_seen,
+                        "baseline": _drops_baseline}, indent=2),
+            encoding="utf-8",
+        )
+        temp.replace(DROPS_DATA_FILE)
+    except OSError as exc:
+        print(f"[Drops] Could not save settings: {exc}")
+
+
+def _drops_remember(ids) -> None:
+    known = set(_drops_seen)
+    for entry_id in ids:
+        if entry_id not in known:
+            _drops_seen.append(entry_id)
+            known.add(entry_id)
+    del _drops_seen[:-DROPS_SEEN_LIMIT]
+
+
+# ---------- feed parsing ----------
+
+def _drops_local(tag) -> str:
+    return str(tag).rsplit("}", 1)[-1].lower()
+
+
+def _drops_safe(value, limit: int = 1000) -> str:
+    """Third-party text: no accidental @mentions, bounded length."""
+    return str(value or "").replace("@", "@\u200b").strip()[:limit]
+
+
+def _drops_date(text: str) -> Optional[int]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return int(parsedate_to_datetime(text).timestamp())
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except ValueError:
+        return None
+
+
+def _drops_parse_feed(raw: bytes) -> list:
+    """Read RSS or Atom into a list of plain dicts (newest first when dated)."""
+    root = ET.fromstring(raw)
+    nodes = [n for n in root.iter() if _drops_local(n.tag) in ("item", "entry")]
+    entries = []
+    for node in nodes:
+        fields: dict = {}
+        categories: list = []
+        link = ""
+        for child in node:
+            name = _drops_local(child.tag)
+            text = (child.text or "").strip()
+            if name == "link":
+                href = (child.attrib.get("href") or text).strip()
+                if href and (not link or child.attrib.get("rel", "alternate") == "alternate"):
+                    link = href
+            elif name == "category":
+                label = (child.attrib.get("term") or text).strip()
+                if label:
+                    categories.append(label)
+            elif name in ("title", "guid", "id", "description", "summary", "content",
+                          "pubdate", "published", "updated") and name not in fields:
+                fields[name] = text
+
+        title = fields.get("title") or "New Twitch Drops campaign"
+        entry_id = fields.get("guid") or fields.get("id") or link or title
+        summary = fields.get("description") or fields.get("summary") or fields.get("content") or ""
+        stamp = _drops_date(fields.get("pubdate") or fields.get("published") or fields.get("updated") or "")
+        entries.append({
+            "id": str(entry_id),
+            "title": title,
+            "link": link if link.startswith(("https://", "http://")) else "",
+            "summary": summary,
+            "categories": categories,
+            "game": categories[0] if categories else title,
+            "date": stamp,
+        })
+    entries.sort(key=lambda e: e["date"] or 0, reverse=True)
+    return entries
+
+
+async def _drops_fetch() -> list:
+    timeout = aiohttp.ClientTimeout(total=25)
+    headers = {
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml",
+        "User-Agent": "VaultBot/1.0 (Discord Twitch Drops alerts)",
+    }
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(DROPS_FEED_URL) as resp:
+            resp.raise_for_status()
+            data = await resp.content.read(DROPS_MAX_FEED_BYTES)
+    return _drops_parse_feed(data)
+
+
+def _drops_matches(entry: dict, games: list) -> bool:
+    """True if the server follows everything, or any followed name appears in the entry."""
+    if not games:
+        return False
+    if _DROPS_ALL in games:
+        return True
+    haystack = " ".join([entry["title"], " ".join(entry["categories"]), entry["summary"]]).lower()
+    for game in games:
+        if re.search(rf"(?<![a-z0-9]){re.escape(game)}(?![a-z0-9])", haystack):
+            return True
+    return False
+
+
+# ---------- building and sending alerts ----------
+
+def _drops_build(entry: dict, note: Optional[str] = None) -> tuple:
+    description = ""
+    if entry.get("summary"):
+        description = _drops_safe(html_to_text(entry["summary"], 900), 900)
+    embed = discord.Embed(
+        title=_drops_safe(entry["title"], 256),
+        description=description or None,
+        color=DROPS_COLOR,
+    )
+    if entry.get("link"):
+        embed.url = entry["link"]
+    embed.add_field(name="Game", value=_drops_safe(entry.get("game"), 200) or "Unknown", inline=True)
+    if note:
+        embed.add_field(name="Details", value=_drops_safe(note, 1000), inline=False)
+    if entry.get("date"):
+        embed.timestamp = datetime.fromtimestamp(entry["date"], tz=timezone.utc)
+    embed.set_footer(text="Twitch Drops alert • community tracker feed")
+
+    view = None
+    if entry.get("link"):
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link, label="View campaign", url=entry["link"]))
+    return embed, view
+
+
+async def _drops_send(cfg: dict, embed: discord.Embed, view: Optional[discord.ui.View]) -> None:
+    channel_id = int(cfg["channel_id"])
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    content = "🎁 **New Twitch Drops campaign!**"
+    mentions = discord.AllowedMentions.none()
+    if cfg.get("role_id"):
+        role_id = int(cfg["role_id"])
+        content = f"<@&{role_id}> " + content
+        mentions = discord.AllowedMentions(roles=[discord.Object(id=role_id)])
+    kwargs = {"content": content, "embed": embed, "allowed_mentions": mentions}
+    if view is not None:
+        kwargs["view"] = view
+    await channel.send(**kwargs)
+
+
+async def _drops_notify_owner(text: str) -> None:
+    try:
+        info = await bot.application_info()
+        await info.owner.send(text)
+    except Exception as exc:  # noqa: BLE001 - a failed DM must never break polling
+        print(f"[Drops] Could not DM the bot owner: {exc}")
+
+
+# ---------- the checker ----------
+
+async def _drops_poll_once() -> None:
+    global _drops_baseline, _drops_fail_count, _drops_owner_notified
+    global _drops_last_ok, _drops_last_error
+
+    if not DROPS_FEED_URL:
+        return
+
+    try:
+        entries = await _drops_fetch()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError, ValueError) as exc:
+        _drops_fail_count += 1
+        _drops_last_error = f"{type(exc).__name__}: {exc}"[:300]
+        print(f"[Drops] Feed check failed ({_drops_fail_count} in a row): {_drops_last_error}")
+        if _drops_fail_count >= DROPS_FAIL_ALERT_AFTER and not _drops_owner_notified:
+            _drops_owner_notified = True
+            await _drops_notify_owner(
+                f"⚠️ VaultBot's Twitch Drops feed has failed {_drops_fail_count} checks in a row.\n"
+                f"Last error: `{_drops_last_error}`\n"
+                "Alerts are paused until it recovers. You can still use `/drops post` manually."
+            )
+        return
+
+    _drops_last_ok = int(time.time())
+    _drops_last_error = ""
+    recovered = _drops_owner_notified
+    _drops_fail_count = 0
+    _drops_owner_notified = False
+    if recovered:
+        await _drops_notify_owner("✅ VaultBot's Twitch Drops feed is working again.")
+
+    if not entries:
+        return
+
+    if not _drops_baseline:
+        _drops_remember(e["id"] for e in entries)
+        _drops_baseline = True
+        _drops_save()
+        print(f"[Drops] Baseline set with {len(entries)} existing entr(ies); nothing posted.")
+        return
+
+    known = set(_drops_seen)
+    new = [e for e in entries if e["id"] not in known]
+    if not new:
+        return
+    _drops_remember(e["id"] for e in new)
+    _drops_save()
+
+    cutoff = time.time() - DROPS_MAX_AGE_DAYS * 86400
+    fresh = [e for e in new if e["date"] is None or e["date"] >= cutoff]
+    fresh.sort(key=lambda e: e["date"] or 0)            # oldest first
+    fresh = fresh[-DROPS_MAX_POSTS_PER_POLL:]
+
+    for entry in fresh:
+        embed, view = _drops_build(entry)
+        posted = 0
+        for guild_key, cfg in list(_drops_guilds.items()):
+            if not cfg.get("channel_id") or not _drops_matches(entry, cfg.get("games", [])):
+                continue
+            try:
+                await _drops_send(cfg, embed, view)
+                posted += 1
+            except (discord.HTTPException, ValueError, TypeError, AttributeError) as exc:
+                print(f"[Drops] Couldn't post in server {guild_key}: {exc}")
+        print(f"[Drops] '{entry['title'][:60]}' -> {posted} server(s).")
+
+
+# ---------- slash commands:  /drops setup | add | remove | list | status | post ----------
+
+drops_group = app_commands.Group(
+    name="drops",
+    description="Twitch Drops alerts for the games you follow",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+async def _drops_can_manage(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is not None and perms.manage_guild:
+        return True
+    await interaction.response.send_message(
+        "You need the **Manage Server** permission to change Drops alerts.", ephemeral=True)
+    return False
+
+
+def _drops_cfg(guild_id: int) -> dict:
+    return _drops_guilds.setdefault(str(guild_id), {"channel_id": None, "role_id": None, "games": []})
+
+
+@drops_group.command(name="setup", description="Choose the channel (and optional role) for Drops alerts")
+@app_commands.describe(channel="Where alerts are posted", role="Optional role to ping")
+async def drops_setup(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    role: Optional[discord.Role] = None,
+):
+    if not await _drops_can_manage(interaction):
+        return
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await interaction.response.send_message(
+            f"I need **View Channel**, **Send Messages** and **Embed Links** in {channel.mention}.",
+            ephemeral=True)
+        return
+    cfg = _drops_cfg(interaction.guild_id)
+    cfg["channel_id"] = channel.id
+    cfg["role_id"] = role.id if role else None
+    _drops_save()
+    ping = f" and ping {role.mention}" if role else ""
+    hint = "" if cfg["games"] else "\nNow add games with `/drops add`."
+    await interaction.response.send_message(
+        f"✅ Drops alerts will post in {channel.mention}{ping}.{hint}",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@drops_group.command(name="add", description="Follow a game (or type 'all' for every game)")
+@app_commands.describe(game="Game name, e.g. Rust. Matches the campaign title/category.")
+async def drops_add(interaction: discord.Interaction, game: str):
+    if not await _drops_can_manage(interaction):
+        return
+    name = " ".join(game.lower().split())
+    if not 2 <= len(name) <= 60:
+        await interaction.response.send_message("Use a game name between 2 and 60 characters.", ephemeral=True)
+        return
+    cfg = _drops_cfg(interaction.guild_id)
+    if name in cfg["games"]:
+        await interaction.response.send_message(f"Already following **{name}**.", ephemeral=True)
+        return
+    if len(cfg["games"]) >= DROPS_MAX_GAMES_PER_SERVER:
+        await interaction.response.send_message(
+            f"This server already follows {DROPS_MAX_GAMES_PER_SERVER} games. Remove one first.", ephemeral=True)
+        return
+    cfg["games"].append(name)
+    _drops_save()
+    warn = "" if cfg.get("channel_id") else "\nNo channel yet. Run `/drops setup` so alerts have somewhere to go."
+    await interaction.response.send_message(f"✅ Following **{name}**.{warn}", ephemeral=True)
+
+
+async def _drops_game_autocomplete(interaction: discord.Interaction, current: str):
+    games = _drops_guilds.get(str(interaction.guild_id), {}).get("games", [])
+    current = current.lower()
+    return [app_commands.Choice(name=g[:100], value=g) for g in games if current in g][:25]
+
+
+@drops_group.command(name="remove", description="Stop following a game")
+@app_commands.describe(game="The game to stop following")
+@app_commands.autocomplete(game=_drops_game_autocomplete)
+async def drops_remove(interaction: discord.Interaction, game: str):
+    if not await _drops_can_manage(interaction):
+        return
+    name = " ".join(game.lower().split())
+    cfg = _drops_cfg(interaction.guild_id)
+    if name not in cfg["games"]:
+        await interaction.response.send_message("That game isn't on your list. See `/drops list`.", ephemeral=True)
+        return
+    cfg["games"].remove(name)
+    _drops_save()
+    await interaction.response.send_message(f"🗑️ Stopped following **{name}**.", ephemeral=True)
+
+
+@drops_group.command(name="list", description="Show this server's Drops settings")
+async def drops_list(interaction: discord.Interaction):
+    if not await _drops_can_manage(interaction):
+        return
+    cfg = _drops_guilds.get(str(interaction.guild_id))
+    if not cfg:
+        await interaction.response.send_message("Nothing set up yet. Start with `/drops setup`.", ephemeral=True)
+        return
+    channel = f"<#{cfg['channel_id']}>" if cfg.get("channel_id") else "Not set"
+    role = f"<@&{cfg['role_id']}>" if cfg.get("role_id") else "No ping"
+    games = "\n".join(f"• {g}" for g in cfg.get("games", [])) or "None yet. Use `/drops add`."
+    embed = discord.Embed(title="🎁 Drops alerts", color=DROPS_COLOR)
+    embed.add_field(name="Channel", value=channel, inline=True)
+    embed.add_field(name="Ping", value=role, inline=True)
+    embed.add_field(name="Followed games", value=games[:1000], inline=False)
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@drops_group.command(name="status", description="Check whether the Drops feed is working")
+async def drops_status(interaction: discord.Interaction):
+    if not await _drops_can_manage(interaction):
+        return
+    if not DROPS_FEED_URL:
+        lines = ["❌ No feed is configured. The bot owner must set `DROPS_FEED_URL` and restart."]
+    else:
+        lines = [f"Checking every **{DROPS_POLL_MINUTES}** minute(s)."]
+        if _drops_last_ok:
+            lines.append(f"Last successful read: <t:{_drops_last_ok}:R>")
+        else:
+            lines.append("No successful read yet.")
+        if _drops_fail_count:
+            lines.append(f"⚠️ {_drops_fail_count} failed check(s) in a row. Last error: `{_drops_last_error[:150]}`")
+        elif _drops_last_ok:
+            lines.append("✅ Feed is healthy.")
+        if not _drops_baseline:
+            lines.append("Waiting for the first read to finish before alerts can start.")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@drops_group.command(name="post", description="Manually post a Drops campaign the feed missed")
+@app_commands.describe(
+    game="Game name",
+    reward="What the drops give",
+    ends="When the campaign ends (free text, e.g. 'Nov 3')",
+    link="Optional https:// link with details",
+)
+async def drops_post(
+    interaction: discord.Interaction,
+    game: str,
+    reward: str,
+    ends: Optional[str] = None,
+    link: Optional[str] = None,
+):
+    if not await _drops_can_manage(interaction):
+        return
+    cfg = _drops_guilds.get(str(interaction.guild_id))
+    if not cfg or not cfg.get("channel_id"):
+        await interaction.response.send_message("Run `/drops setup` first.", ephemeral=True)
+        return
+    if link and not link.lower().startswith("https://"):
+        await interaction.response.send_message("The link must start with https://", ephemeral=True)
+        return
+    entry = {
+        "title": f"{game[:100]} Drops",
+        "game": game[:100],
+        "summary": "",
+        "link": (link or "")[:500],
+        "date": int(time.time()),
+    }
+    note = f"**Rewards:** {reward[:500]}" + (f"\n**Ends:** {ends[:100]}" if ends else "")
+    embed, view = _drops_build(entry, note)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await _drops_send(cfg, embed, view)
+        await interaction.followup.send("✅ Posted.", ephemeral=True)
+    except (discord.HTTPException, ValueError, TypeError) as exc:
+        await interaction.followup.send(f"❌ Couldn't post: {exc}", ephemeral=True)
+
+
+# ---------- hook-up ----------
+
+def _install_drops() -> None:
+    bot.tree.add_command(drops_group)
+
+    @tasks.loop(minutes=DROPS_POLL_MINUTES)
+    async def drops_loop():
+        try:
+            await _drops_poll_once()
+        except Exception as exc:  # noqa: BLE001 - one bad round must not stop future checks
+            print(f"[Drops] Check failed: {type(exc).__name__}: {exc}")
+
+    @drops_loop.before_loop
+    async def _drops_wait():
+        await bot.wait_until_ready()
+
+    async def _drops_on_ready():
+        global _drops_started
+        if _drops_started:  # on_ready can fire again after a reconnect
+            return
+        _drops_started = True
+        _drops_load()
+        if not DROPS_FEED_URL:
+            print("[Drops] DROPS_FEED_URL is not set; automatic alerts are off (/drops post still works).")
+            return
+        if not drops_loop.is_running():
+            drops_loop.start()
+        print(f"[Drops] Reading the feed every {DROPS_POLL_MINUTES} minute(s).")
+
+    bot.add_listener(_drops_on_ready, "on_ready")
+
+
+_install_drops()
+
+
+# =============================================================================
 # 13. STARTUP
 # =============================================================================
 if not TOKEN:
