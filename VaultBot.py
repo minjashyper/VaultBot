@@ -3350,14 +3350,44 @@ async def _fetch_fortnite() -> list:
 
 
 async def _fetch_hypex() -> list:
-    """Read recent HYPEX posts through FxTwitter's public RSS feed."""
-    url = "https://fxtwitter.com/HYPEX/feed.xml"
+    """Read recent HYPEX posts through public FxEmbed RSS/Atom feed endpoints.
+
+    Try several documented endpoint variants so a single feed URL returning
+    404 does not disable HYPEX alerts. If every bridge is unavailable, raise
+    the final error; the caller keeps official Fortnite monitoring running.
+    """
+    urls = (
+        "https://fxtwitter.com/hypex/feed.xml",
+        "https://fxtwitter.com/hypex/feed.atom.xml",
+        "https://fixupx.com/hypex/feed.xml",
+        "https://fixupx.com/hypex/feed.atom.xml",
+    )
     timeout = aiohttp.ClientTimeout(total=20)
-    headers = {"Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"}
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as resp:
-            resp.raise_for_status()
-            raw = await resp.text()
+    headers = {
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml",
+        "User-Agent": "VaultBot/1.0 (+Discord Fortnite update feed)",
+    }
+    raw = None
+    errors = []
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for url in urls:
+            try:
+                async with session.get(url, allow_redirects=True) as resp:
+                    if resp.status == 404:
+                        errors.append(f"{url}: HTTP 404")
+                        continue
+                    resp.raise_for_status()
+                    candidate = await resp.text()
+                    # Some bridges may return an HTML error page with HTTP 200.
+                    if "<rss" not in candidate[:1000].lower() and "<feed" not in candidate[:1000].lower():
+                        errors.append(f"{url}: response was not RSS/Atom XML")
+                        continue
+                    raw = candidate
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                errors.append(f"{url}: {exc}")
+    if raw is None:
+        raise aiohttp.ClientError("all HYPEX feed endpoints failed: " + "; ".join(errors))
 
     root = ET.fromstring(raw)
     entries = root.findall(".//item")
