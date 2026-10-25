@@ -52,6 +52,9 @@ from discord.ext import commands, tasks
 import yt_dlp
 
 
+import html
+from datetime import timezone
+from discord import app_commands
 # =============================================================================
 # 2. CONFIGURATION & CONSTANTS
 # =============================================================================
@@ -2930,6 +2933,660 @@ async def _start_freestuff_alerts():
     _freestuff_status = "running"
     print(f"[FreeStuff] Webhook server listening on port {FREESTUFF_PORT} at {FREESTUFF_WEBHOOK_PATH}")
 
+
+# =============================================================================
+# 12c. PATCH NOTES (merged from patchnotes.py)
+# =============================================================================
+"""
+patchnotes.py - game & driver update alerts for VaultBot.
+
+How it works
+------------
+* /patchnotes add      follows a Steam game (Steam's public news feed, no key).
+* /patchnotes addfeed  follows Minecraft (Java/Bedrock), NVIDIA GeForce drivers
+                       or Fortnite updates.
+* Every few minutes the bot checks each followed source and posts anything it
+  hasn't posted before to the subscribed channel as an embed.
+
+This file is self-contained. VaultBot.py loads it inside a try/except, so if
+anything in here ever fails, the rest of the bot keeps running.
+
+Optional environment variables (all have sensible defaults):
+  PATCHNOTES_POLL_MINUTES   how often to check Steam (default 10)
+  PATCHNOTES_DATA_FILE      where subscriptions are saved
+                            (default: patchnotes_data.json next to this file)
+  NVIDIA_PFID               NVIDIA product ID used for the driver lookup
+                            (default 877; all GeForce desktop cards share one driver)
+"""
+
+
+
+# -----------------------------------------------------------------------------
+# Settings
+# -----------------------------------------------------------------------------
+STEAM_NEWS_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
+STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
+STEAM_DETAILS_URL = "https://store.steampowered.com/api/appdetails"
+STEAM_HEADER_URL = "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"
+
+MINECRAFT_URL = "https://launchercontent.mojang.com/{kind}PatchNotes.json"
+MINECRAFT_HOST = "https://launchercontent.mojang.com"
+NVIDIA_URL = "https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php"
+NVIDIA_PFID = os.getenv("NVIDIA_PFID", "877").strip() or "877"
+FORTNITE_BUILD_URL = "https://fortnite-api.com/v2/aes"
+FORTNITE_NEWS_PAGE = "https://www.fortnite.com/news"
+
+DATA_FILE = Path(os.getenv(
+    "PATCHNOTES_DATA_FILE",
+    str(Path(__file__).resolve().parent / "patchnotes_data.json"),
+))
+
+MAX_GAMES_PER_SERVER = 25     # keeps one server from creating endless lookups
+MAX_POSTS_PER_POLL = 3        # if a game posts a burst of news, only send the newest few
+MAX_AGE_DAYS = 14             # never announce posts older than this (prevents old-news floods)
+SEEN_HISTORY = 100            # how many post IDs to remember per game
+EMBED_COLOR = discord.Color.from_rgb(102, 192, 244)
+
+
+def _poll_minutes() -> int:
+    try:
+        return max(2, int(os.getenv("PATCHNOTES_POLL_MINUTES", "10")))
+    except (TypeError, ValueError):
+        print("[PatchNotes] PATCHNOTES_POLL_MINUTES must be a number; using 10.")
+        return 10
+
+
+POLL_MINUTES = _poll_minutes()
+
+# -----------------------------------------------------------------------------
+# Saved data
+#   _subs: server ID (text) -> game ID (text) -> {"name", "channel_id", "role_id"}
+#   _seen: game ID (text)   -> list of post IDs already handled
+# -----------------------------------------------------------------------------
+_bot: Optional[discord.Client] = None
+_subs: dict = {}
+_seen: dict = {}
+_started = False
+
+
+def _load() -> None:
+    global _subs, _seen
+    try:
+        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        subs = data.get("subs", {})
+        seen = data.get("seen", {})
+        if isinstance(subs, dict) and isinstance(seen, dict):
+            _subs, _seen = subs, seen
+        total = sum(len(g) for g in _subs.values())
+        print(f"[PatchNotes] Loaded {total} subscription(s) across {len(_subs)} server(s).")
+    except FileNotFoundError:
+        print("[PatchNotes] No saved subscriptions yet. Use /patchnotes add to create one.")
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        # Keep the unreadable file instead of overwriting it with an empty one.
+        print(f"[PatchNotes] Could not read {DATA_FILE.name}: {exc}")
+        try:
+            DATA_FILE.replace(DATA_FILE.with_name(DATA_FILE.name + ".unreadable"))
+        except OSError:
+            pass
+
+
+def _save() -> None:
+    try:
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp = DATA_FILE.with_name(DATA_FILE.name + ".tmp")
+        temp.write_text(json.dumps({"subs": _subs, "seen": _seen}, indent=2), encoding="utf-8")
+        temp.replace(DATA_FILE)
+    except OSError as exc:
+        print(f"[PatchNotes] Could not save subscriptions: {exc}")
+
+
+# -----------------------------------------------------------------------------
+# Steam lookups
+# -----------------------------------------------------------------------------
+async def _get_json(url: str, params: dict):
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params, headers={"Accept": "application/json"}) as resp:
+            resp.raise_for_status()
+            return await resp.json(content_type=None)
+
+
+async def _fetch_news(appid: str, count: int = 6) -> list:
+    """Newest developer announcements for a Steam game, newest first."""
+    payload = await _get_json(STEAM_NEWS_URL, {
+        "appid": appid,
+        "count": count,
+        "maxlength": 3000,
+        "feeds": "steam_community_announcements",
+        "format": "json",
+    })
+    items = (payload or {}).get("appnews", {}).get("newsitems", []) or []
+    items = [i for i in items if isinstance(i, dict) and i.get("gid")]
+    items.sort(key=lambda i: int(i.get("date") or 0), reverse=True)
+    return items
+
+
+async def _search_game(query: str) -> Optional[tuple]:
+    """Find a game by name. Returns (appid, name) or None."""
+    payload = await _get_json(STEAM_SEARCH_URL, {"term": query, "l": "english", "cc": "US"})
+    items = (payload or {}).get("items", []) or []
+    apps = [i for i in items if i.get("type", "app") == "app" and i.get("id")]
+    if not apps:
+        return None
+    return str(apps[0]["id"]), str(apps[0].get("name") or f"App {apps[0]['id']}")
+
+
+async def _game_name(appid: str) -> str:
+    try:
+        payload = await _get_json(STEAM_DETAILS_URL, {"appids": appid, "filters": "basic"})
+        entry = (payload or {}).get(appid, {})
+        if entry.get("success"):
+            return str(entry["data"].get("name") or f"App {appid}")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+        pass
+    return f"App {appid}"
+
+
+# -----------------------------------------------------------------------------
+# Turning a Steam post into a Discord embed
+# -----------------------------------------------------------------------------
+def _tidy(t: str, limit: int) -> str:
+    """Final clean-up shared by every source: entities, blank lines, length."""
+    t = html.unescape(t)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > limit:
+        t = t[:limit].rsplit(" ", 1)[0].rstrip() + "…"
+        if t.count("**") % 2:      # don't leave bold switched on after cutting
+            t += "**"
+    return t
+
+
+def clean_contents(text: str, limit: int = 700) -> str:
+    """Steam posts use BBCode ([b], [list], [img]...). Make it readable plain text."""
+    t = text or ""
+    t = re.sub(r"\[img\].*?\[/img\]", "", t, flags=re.I | re.S)
+    t = re.sub(r"\[previewyoutube=[^\]]*\](?:\[/previewyoutube\])?", "", t, flags=re.I)
+    t = re.sub(r"\[url=[^\]]*\](.*?)\[/url\]", r"\1", t, flags=re.I | re.S)
+    t = re.sub(r"\[h[1-6]\](.*?)\[/h[1-6]\]", r"**\1**", t, flags=re.I | re.S)
+    t = re.sub(r"\[b\](.*?)\[/b\]", r"**\1**", t, flags=re.I | re.S)
+    t = t.replace("[*]", "\n• ")
+    t = re.sub(r"\[/?[a-z0-9_]+(?:=[^\]]*)?\]", "", t, flags=re.I)   # any other tag
+    t = re.sub(r"\{STEAM_CLAN_IMAGE\}\S*", "", t)
+    return _tidy(t, limit)
+
+
+def html_to_text(raw: str, limit: int = 700) -> str:
+    """Minecraft's notes are HTML. Keep headings and bullets, drop the rest."""
+    t = raw or ""
+    t = re.sub(r"(?is)<(script|style).*?</\1>", "", t)
+    t = re.sub(r"(?is)<h[1-6][^>]*>(.*?)</h[1-6]>", r"\n**\1**\n", t)
+    t = re.sub(r"(?i)<li[^>]*>", "\n• ", t)
+    t = re.sub(r"(?i)<(?:br|/p|/div|/ul|/ol)[^>]*>", "\n", t)
+    t = re.sub(r"<[^>]+>", "", t)
+    return _tidy(t, limit)
+
+
+def _parse_date(value) -> int:
+    """Best-effort timestamp from a date string; falls back to 'now'."""
+    text = str(value or "").strip()
+    if text:
+        try:
+            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            pass
+        for fmt in ("%a %b %d, %Y", "%b %d, %Y"):
+            try:
+                return int(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).timestamp())
+            except ValueError:
+                continue
+    return int(time.time())
+
+
+def build_embed(appid: str, game: str, item: dict) -> discord.Embed:
+    title = (item.get("title") or "New update").strip()[:256]
+    if item.get("plain"):            # already cleaned by a non-Steam source
+        description = (item.get("contents") or "")[:1500]
+    else:
+        description = clean_contents(item.get("contents", ""))
+    embed = discord.Embed(
+        title=title,
+        url=item.get("url") or None,
+        description=description or None,
+        color=EMBED_COLOR,
+    )
+    embed.set_author(name=game[:256])
+    if item.get("image"):
+        embed.set_thumbnail(url=item["image"])
+    elif appid.isdigit():
+        embed.set_thumbnail(url=STEAM_HEADER_URL.format(appid=appid))
+    embed.set_footer(text=item.get("footer") or "Steam • patch notes")
+    try:
+        embed.timestamp = datetime.fromtimestamp(int(item["date"]), tz=timezone.utc)
+    except (KeyError, TypeError, ValueError, OSError):
+        pass
+    return embed
+
+
+async def _send(channel_id: int, embed: discord.Embed,
+                role_id: Optional[int] = None, note: Optional[str] = None) -> None:
+    channel = _bot.get_channel(channel_id) or await _bot.fetch_channel(channel_id)
+    content = note
+    mentions = discord.AllowedMentions.none()
+    if role_id:
+        content = f"<@&{role_id}>" + (f" {note}" if note else "")
+        mentions = discord.AllowedMentions(roles=[discord.Object(id=int(role_id))])
+    await channel.send(content=content, embed=embed, allowed_mentions=mentions)
+
+
+# -----------------------------------------------------------------------------
+# Non-Steam sources. Each returns items shaped like the Steam ones:
+#   {"gid", "title", "url", "date", "contents", "plain": True, "image", "footer"}
+# They read services that are NOT officially documented for bots, so every one
+# turns an unexpected reply into a ValueError (reported, never a crash).
+# -----------------------------------------------------------------------------
+async def _fetch_minecraft(kind: str) -> list:
+    payload = await _get_json(MINECRAFT_URL.format(kind=kind), {})
+    try:
+        items = []
+        for e in payload["entries"]:
+            if not isinstance(e, dict):
+                continue
+            version = str(e.get("version") or "").strip()
+            if not version and not e.get("title"):
+                continue
+            image = (e.get("image") or {}).get("url") or ""
+            if image.startswith("/"):
+                image = MINECRAFT_HOST + image
+            items.append({
+                "gid": str(e.get("id") or f"{e.get('type', '')}:{version}"),
+                "title": str(e.get("title") or f"Minecraft {version}"),
+                "url": None,
+                "date": _parse_date(e.get("date")),
+                "contents": html_to_text(e.get("body", "")),
+                "plain": True,
+                "image": image if image.startswith("http") else None,
+                "footer": "Minecraft • patch notes",
+            })
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"unexpected Minecraft feed format ({exc})")
+    items.sort(key=lambda i: i["date"], reverse=True)    # stable: keeps feed order on ties
+    return items[:6]
+
+
+async def _fetch_nvidia() -> list:
+    payload = await _get_json(NVIDIA_URL, {
+        "func": "DriverManualLookup", "pfid": NVIDIA_PFID, "osID": "57", "dch": "1",
+    })
+    try:
+        info = payload["IDS"][0]["downloadInfo"]
+        version = str(info["Version"]).strip()
+        name = str(info.get("Name") or "GeForce Game Ready Driver").strip()
+        released = str(info.get("ReleaseDateTime") or "").strip()
+        details = info.get("DetailsURL") or None
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise ValueError(f"unexpected NVIDIA reply ({exc})")
+    if not version:
+        raise ValueError("NVIDIA reply had no driver version")
+    lines = [f"**Version:** {version}"]
+    if released:
+        lines.append(f"**Released:** {released}")
+    lines.append("Get it from the NVIDIA App or nvidia.com/drivers.")
+    return [{
+        "gid": version,
+        "title": f"{name} {version}",
+        "url": details,
+        "date": _parse_date(released),
+        "contents": "\n".join(lines),
+        "plain": True,
+        "image": None,
+        "footer": "NVIDIA • driver update",
+    }]
+
+
+async def _fetch_fortnite() -> list:
+    payload = await _get_json(FORTNITE_BUILD_URL, {})
+    try:
+        build = str(payload["data"]["build"]).strip()
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"unexpected Fortnite reply ({exc})")
+    found = re.search(r"Release-(\d+(?:\.\d+)*)", build)
+    version = found.group(1) if found else build
+    if not version:
+        raise ValueError("Fortnite reply had no build")
+    return [{
+        "gid": version,
+        "title": f"Fortnite v{version} is live",
+        "url": FORTNITE_NEWS_PAGE,
+        "date": int(time.time()),
+        "contents": "A new Fortnite update has gone live. "
+                    "Epic posts the full patch notes on the Fortnite website (link above).",
+        "plain": True,
+        "image": None,
+        "footer": "Fortnite • update detected",
+    }]
+
+
+FEEDS = {
+    "feed:minecraft_java": ("Minecraft: Java Edition", lambda: _fetch_minecraft("java")),
+    "feed:minecraft_bedrock": ("Minecraft: Bedrock Edition", lambda: _fetch_minecraft("bedrock")),
+    "feed:nvidia": ("NVIDIA GeForce drivers", _fetch_nvidia),
+    "feed:fortnite": ("Fortnite updates", _fetch_fortnite),
+}
+
+
+async def _fetch_items(key: str) -> list:
+    """One entry point for every source: a Steam app ID or a feed key."""
+    if key in FEEDS:
+        return await FEEDS[key][1]()
+    if key.startswith("feed:"):
+        raise ValueError(f"unknown source {key}")
+    return await _fetch_news(key)
+
+
+# -----------------------------------------------------------------------------
+# Background checker
+# -----------------------------------------------------------------------------
+def _remember(appid: str, gids: list) -> None:
+    history = _seen.setdefault(appid, [])
+    for gid in gids:
+        if gid not in history:
+            history.append(gid)
+    del history[:-SEEN_HISTORY]
+
+
+async def poll_once() -> None:
+    targets: dict = {}   # game ID -> [(server ID, subscription), ...]
+    for guild_id, games in _subs.items():
+        for appid, sub in games.items():
+            targets.setdefault(appid, []).append((guild_id, sub))
+
+    changed = False
+    cutoff = time.time() - MAX_AGE_DAYS * 86400
+    for appid, subscribers in targets.items():
+        try:
+            items = await _fetch_items(appid)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            print(f"[PatchNotes] Lookup failed for {appid}: {exc}")
+            continue
+
+        if appid not in _seen:       # first time we see this game: just remember what's there
+            _remember(appid, [i["gid"] for i in items])
+            changed = True
+            continue
+
+        known = set(_seen[appid])
+        new = [i for i in items if i["gid"] not in known]
+        if not new:
+            continue
+        _remember(appid, [i["gid"] for i in new])
+        changed = True
+
+        fresh = [i for i in new if int(i.get("date") or 0) >= cutoff]
+        fresh.sort(key=lambda i: int(i.get("date") or 0))      # oldest first
+        fresh = fresh[-MAX_POSTS_PER_POLL:]
+
+        for guild_id, sub in subscribers:
+            for item in fresh:
+                try:
+                    await _send(int(sub["channel_id"]), build_embed(appid, sub["name"], item),
+                                role_id=sub.get("role_id"))
+                    print(f"[PatchNotes] Posted '{item.get('title', '')[:60]}' ({sub['name']}) in server {guild_id}.")
+                except (discord.HTTPException, ValueError, TypeError, AttributeError) as exc:
+                    print(f"[PatchNotes] Couldn't post for {sub['name']} in server {guild_id}: {exc}")
+        await asyncio.sleep(1)       # be gentle with Steam
+
+    if changed:
+        _save()
+
+
+def _make_loop():
+    @tasks.loop(minutes=POLL_MINUTES)
+    async def patchnotes_loop():
+        try:
+            await poll_once()
+        except Exception as exc:     # never let one bad round stop future checks
+            print(f"[PatchNotes] Check failed: {type(exc).__name__}: {exc}")
+
+    @patchnotes_loop.before_loop
+    async def _wait():
+        await _bot.wait_until_ready()
+
+    return patchnotes_loop
+
+
+# -----------------------------------------------------------------------------
+# Slash commands:  /patchnotes add | remove | list
+# -----------------------------------------------------------------------------
+group = app_commands.Group(
+    name="patchnotes",
+    description="Get Steam game patch notes posted in a channel",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+async def _require_manager(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is not None and perms.manage_guild:
+        return True
+    await interaction.response.send_message(
+        "You need the **Manage Server** permission to change patch note alerts.", ephemeral=True
+    )
+    return False
+
+
+async def _prepare_target(interaction: discord.Interaction, channel):
+    """Pick the channel and make sure the bot can post there. None = already replied."""
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message("Pick a regular text channel.", ephemeral=True)
+        return None
+    perms = target.permissions_for(interaction.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await interaction.response.send_message(
+            f"I need **View Channel**, **Send Messages** and **Embed Links** in {target.mention}.",
+            ephemeral=True,
+        )
+        return None
+    return target
+
+
+async def _subscribe(interaction: discord.Interaction, key: str, name: str, items: list,
+                     target: discord.TextChannel, role: Optional[discord.Role], where: str) -> None:
+    """Save a subscription, remember what already exists, and post a one-time preview."""
+    games = _subs.setdefault(str(interaction.guild_id), {})
+    if key not in games and len(games) >= MAX_GAMES_PER_SERVER:
+        await interaction.followup.send(
+            f"This server already follows {MAX_GAMES_PER_SERVER} sources. Remove one first.",
+            ephemeral=True)
+        return
+
+    games[key] = {"name": name, "channel_id": target.id, "role_id": role.id if role else None}
+    if key not in _seen:             # start from "now" so old posts aren't dumped into the channel
+        _remember(key, [i["gid"] for i in items])
+    _save()
+
+    try:   # show the newest post once, so you can see exactly how alerts will look
+        await _send(target.id, build_embed(key, name, items[0]),
+                    note=f"✅ Updates for **{name}** will post here. Latest one, as a preview:")
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            f"Saved, but I couldn't post in {target.mention}: {exc}", ephemeral=True)
+        return
+
+    ping = f" and ping {role.mention}" if role else ""
+    await interaction.followup.send(
+        f"✅ Following **{name}**{where} in {target.mention}{ping}.", ephemeral=True)
+
+
+@group.command(name="add", description="Post a Steam game's patch notes in a channel")
+@app_commands.describe(
+    game="Game name (or its Steam app ID, the number in its store page link)",
+    channel="Where to post the patch notes (default: this channel)",
+    role="Optional role to ping for each new update",
+)
+async def patchnotes_add(
+    interaction: discord.Interaction,
+    game: str,
+    channel: Optional[discord.TextChannel] = None,
+    role: Optional[discord.Role] = None,
+):
+    if not await _require_manager(interaction):
+        return
+    target = await _prepare_target(interaction, channel)
+    if target is None:
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    query = game.strip()
+    try:
+        if query.isdigit():
+            appid, name = query, await _game_name(query)
+        else:
+            found = await _search_game(query)
+            if not found:
+                await interaction.followup.send(
+                    f"I couldn't find a Steam game called **{query[:80]}**. "
+                    "Try the exact name, or use its Steam app ID.", ephemeral=True)
+                return
+            appid, name = found
+        items = await _fetch_items(appid)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        await interaction.followup.send(
+            "Steam didn't answer just now. Please try again in a minute.", ephemeral=True)
+        return
+
+    if not items:
+        await interaction.followup.send(
+            f"**{name}** has no developer announcements on Steam, so there's nothing to follow.",
+            ephemeral=True)
+        return
+
+    await _subscribe(
+        interaction, appid, name, items, target, role,
+        where=f" (Steam app {appid}). Not the right game? Use `/patchnotes remove`, "
+              "then add it again with its Steam app ID")
+
+
+@group.command(name="addfeed", description="Follow Minecraft, NVIDIA drivers or Fortnite updates")
+@app_commands.describe(
+    source="What to follow",
+    channel="Where to post the updates (default: this channel)",
+    role="Optional role to ping for each new update",
+)
+@app_commands.choices(source=[
+    app_commands.Choice(name=label, value=key) for key, (label, _fn) in FEEDS.items()
+])
+async def patchnotes_addfeed(
+    interaction: discord.Interaction,
+    source: str,
+    channel: Optional[discord.TextChannel] = None,
+    role: Optional[discord.Role] = None,
+):
+    if not await _require_manager(interaction):
+        return
+    if source not in FEEDS:
+        await interaction.response.send_message("Unknown source.", ephemeral=True)
+        return
+    target = await _prepare_target(interaction, channel)
+    if target is None:
+        return
+
+    label = FEEDS[source][0]
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        items = await _fetch_items(source)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        await interaction.followup.send(
+            f"I couldn't read the **{label}** source right now ({str(exc)[:150]}). "
+            "It may be down or may have changed. Try again later.", ephemeral=True)
+        return
+    if not items:
+        await interaction.followup.send(
+            f"The **{label}** source returned nothing, so there's nothing to follow yet.",
+            ephemeral=True)
+        return
+    await _subscribe(interaction, source, label, items, target, role, where="")
+
+
+async def _remove_autocomplete(interaction: discord.Interaction, current: str):
+    games = _subs.get(str(interaction.guild_id), {})
+    current = current.lower()
+    return [
+        app_commands.Choice(name=sub["name"][:100], value=appid)
+        for appid, sub in games.items()
+        if current in sub["name"].lower() or current in appid
+    ][:25]
+
+
+@group.command(name="remove", description="Stop following a game or feed")
+@app_commands.describe(game="The game or feed to stop following")
+@app_commands.autocomplete(game=_remove_autocomplete)
+async def patchnotes_remove(interaction: discord.Interaction, game: str):
+    if not await _require_manager(interaction):
+        return
+    games = _subs.get(str(interaction.guild_id), {})
+    key = game.strip()
+    if key not in games:
+        key = next((a for a, s in games.items() if s["name"].lower() == key.lower()), "")
+    if not key:
+        await interaction.response.send_message(
+            "That game isn't on this server's list. Use `/patchnotes list` to see it.", ephemeral=True)
+        return
+    name = games.pop(key)["name"]
+    if not games:
+        _subs.pop(str(interaction.guild_id), None)
+    if not any(key in g for g in _subs.values()):
+        _seen.pop(key, None)         # nobody follows it any more
+    _save()
+    await interaction.response.send_message(f"🗑️ Stopped following **{name}**.", ephemeral=True)
+
+
+@group.command(name="list", description="Show what this server follows")
+async def patchnotes_list(interaction: discord.Interaction):
+    if not await _require_manager(interaction):
+        return
+    games = _subs.get(str(interaction.guild_id), {})
+    if not games:
+        await interaction.response.send_message(
+            "No games yet. Add one with `/patchnotes add`.", ephemeral=True)
+        return
+    lines = []
+    for appid, sub in games.items():
+        ping = f" (pings <@&{sub['role_id']}>)" if sub.get("role_id") else ""
+        kind = f"Steam app {appid}" if appid.isdigit() else "feed"
+        lines.append(f"• **{sub['name']}** ({kind}) → <#{sub['channel_id']}>{ping}")
+    embed = discord.Embed(title="📰 Patch note alerts", description="\n".join(lines)[:4000],
+                          color=EMBED_COLOR)
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# -----------------------------------------------------------------------------
+# Hook-up (called once from VaultBot.py)
+# -----------------------------------------------------------------------------
+def install(bot: discord.Client) -> None:
+    global _bot
+    _bot = bot
+    bot.tree.add_command(group)
+    loop = _make_loop()
+
+    async def _on_ready():
+        global _started
+        if _started:                 # on_ready can fire again after a reconnect
+            return
+        _started = True
+        _load()
+        if not loop.is_running():
+            loop.start()
+        print(f"[PatchNotes] Checking Steam every {POLL_MINUTES} minute(s).")
+
+    bot.add_listener(_on_ready, "on_ready")
+
+
+# Install PatchNotes commands and its background polling loop.
+install(bot)
 
 # =============================================================================
 # 13. STARTUP
