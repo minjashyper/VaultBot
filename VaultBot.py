@@ -2719,6 +2719,33 @@ class FreeStuffTypeSelect(discord.ui.Select):
         await self.view.update_settings(interaction, types=list(self.values))
 
 
+class FreeStuffChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Pick the channel for alerts…",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.update_settings(interaction, channel_id=self.values[0].id)
+
+
+class FreeStuffRoleSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="Or ping a role instead (optional)…",
+            min_values=1,
+            max_values=1,
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.update_settings(interaction, ping="role", role_id=self.values[0].id)
+
+
 class FreeStuffPanelView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=300)
@@ -2726,8 +2753,10 @@ class FreeStuffPanelView(discord.ui.View):
         self.guild_id = guild_id
         self.message: Optional[discord.Message] = None
         settings = _fs_get(guild_id)
+        self.add_item(FreeStuffChannelSelect())
         self.add_item(FreeStuffStoreSelect(settings["stores"]))
         self.add_item(FreeStuffTypeSelect(settings["types"]))
+        self.add_item(FreeStuffRoleSelect())
         self._sync_ping_buttons(settings)
 
     def _sync_ping_buttons(self, settings: dict) -> None:
@@ -2771,16 +2800,6 @@ class FreeStuffPanelView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
-    @discord.ui.channel_select(
-        placeholder="Pick the channel for alerts…",
-        channel_types=[discord.ChannelType.text],
-        min_values=1,
-        max_values=1,
-        row=0,
-    )
-    async def channel_pick(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        await self.update_settings(interaction, channel_id=select.values[0].id)
-
     @discord.ui.button(label="No ping", style=discord.ButtonStyle.secondary, row=3)
     async def ping_none(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_settings(interaction, ping="none")
@@ -2808,15 +2827,6 @@ class FreeStuffPanelView(discord.ui.View):
     @discord.ui.button(label="Turn off", emoji="⛔", style=discord.ButtonStyle.danger, row=3)
     async def turn_off(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_settings(interaction, channel_id=None)
-
-    @discord.ui.role_select(
-        placeholder="Or ping a role instead (optional)…",
-        min_values=1,
-        max_values=1,
-        row=4,
-    )
-    async def role_pick(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        await self.update_settings(interaction, ping="role", role_id=select.values[0].id)
 
 
 @bot.tree.command(
@@ -2883,4 +2893,3 @@ if not shutil.which("ffmpeg"):
     print("WARNING: ffmpeg executable not found. Voice playback will fail until FFmpeg is available.")
 
 bot.run(TOKEN)
-
