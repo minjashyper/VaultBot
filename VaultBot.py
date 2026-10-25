@@ -2432,6 +2432,10 @@ _freestuff_seen: OrderedDict = OrderedDict()  # message IDs already handled (rep
 _freestuff_tasks: set = set()
 _freestuff_key = None
 _freestuff_started = False
+_freestuff_status = "still starting up. Try /freestuff again in a few seconds."
+_freestuff_last_ok = None       # unix time of the last genuine message from FreeStuff
+_freestuff_rejected = 0         # how many messages failed the signature check
+_freestuff_last_reject = ""     # why the most recent one failed
 
 
 # ---------- saved settings ----------
@@ -2479,33 +2483,54 @@ def _fs_update(guild_id: int, **changes) -> None:
 
 # ---------- webhook verification ----------
 
-def _load_freestuff_key(raw: str):
-    """Accept the Ed25519 public key as hex or base64."""
-    raw = raw.removeprefix("whpk_")
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def _decode_freestuff_key(raw: str) -> bytes:
+    """Return the raw 32-byte Ed25519 public key from hex, base64, or PEM/DER text."""
+    text = raw.strip().strip('"').strip("'")
+    if "BEGIN" in text:  # PEM: drop the ----- lines and keep the base64 body
+        text = "".join(line for line in text.splitlines() if not line.startswith("-----"))
+    text = "".join(text.removeprefix("whpk_").split())
     try:
-        key_bytes = bytes.fromhex(raw)
+        data = bytes.fromhex(text)
     except ValueError:
-        key_bytes = base64.b64decode(raw + "=" * (-len(raw) % 4))
-    return VerifyKey(key_bytes)
+        padded = text + "=" * (-len(text) % 4)
+        try:
+            data = base64.b64decode(padded, validate=True)
+        except (binascii.Error, ValueError):
+            data = base64.urlsafe_b64decode(padded)
+    if len(data) == 44 and data.startswith(_ED25519_SPKI_PREFIX):
+        data = data[len(_ED25519_SPKI_PREFIX):]  # standard wrapper around the 32-byte key
+    if len(data) != 32:
+        raise ValueError(f"expected a 32-byte key but it decoded to {len(data)} bytes")
+    return data
 
 
-def _verify_freestuff_request(msg_id, timestamp, signature_header, body, verify_key) -> bool:
-    """Check the Standard Webhooks signature and that the message is recent."""
+def _load_freestuff_key(raw: str):
+    return VerifyKey(_decode_freestuff_key(raw))
+
+
+def _verify_freestuff_request(msg_id, timestamp, signature_header, body, verify_key):
+    """Check the Standard Webhooks signature. Returns None if valid, else a short reason."""
     try:
         sent_ms = int(timestamp) * 1000 + FREESTUFF_EPOCH_MS
     except (TypeError, ValueError):
-        return False
+        return "the Webhook-Timestamp header was missing or not a number"
     if abs(time.time() * 1000 - sent_ms) > FREESTUFF_MAX_AGE_SECONDS * 1000:
-        return False
+        return "the message timestamp is too far from this host's clock"
     signed = f"{msg_id}.{timestamp}.".encode() + body
-    for part in signature_header.split():
-        _, _, sig_b64 = part.partition(",")
+    parts = signature_header.split()
+    if not parts:
+        return "the Webhook-Signature header was missing"
+    for part in parts:
+        sig_b64 = part.split(",", 1)[-1]  # "v1a,<base64>" or just "<base64>"
         try:
             verify_key.verify(signed, base64.b64decode(sig_b64))
-            return True
+            return None
         except (BadSignatureError, ValueError):
             continue
-    return False
+    return "the signature didn't match this public key (wrong key, or the data was changed)"
 
 
 # ---------- building and sending alerts ----------
@@ -2626,8 +2651,14 @@ async def _handle_freestuff_webhook(request: web.Request) -> web.Response:
     timestamp = request.headers.get("Webhook-Timestamp", "")
     signature = request.headers.get("Webhook-Signature", "")
 
-    if not _verify_freestuff_request(msg_id, timestamp, signature, body, _freestuff_key):
+    global _freestuff_last_ok, _freestuff_rejected, _freestuff_last_reject
+    reason = _verify_freestuff_request(msg_id, timestamp, signature, body, _freestuff_key)
+    if reason:
+        _freestuff_rejected += 1
+        _freestuff_last_reject = reason
+        print(f"[FreeStuff] Rejected a webhook: {reason}.")
         return web.Response(status=401)
+    _freestuff_last_ok = int(time.time())
 
     # Duplicate delivery (FreeStuff retries): acknowledge without posting again.
     if msg_id in _freestuff_seen:
@@ -2677,10 +2708,21 @@ def _build_freestuff_panel_embed(settings: dict) -> discord.Embed:
     embed.add_field(name="Game types", value=types, inline=False)
     if _freestuff_key is None:
         embed.add_field(
-            name="⚠️ Webhook",
-            value="The FreeStuff webhook isn't running on this host, so no alerts will arrive yet. Check the bot console.",
+            name="⚠️ Webhook is off",
+            value=f"No alerts will arrive until this is fixed: {_freestuff_status}"[:1000],
             inline=False,
         )
+    else:
+        if _freestuff_last_ok:
+            contact = f"Last message from FreeStuff: <t:{_freestuff_last_ok}:R>"
+        else:
+            contact = "No message from FreeStuff yet. Press the ping button on the FreeStuff dashboard to test."
+        lines = [f"✅ Receiver is running on port {FREESTUFF_PORT}.", contact]
+        if _freestuff_rejected:
+            lines.append(
+                f"⚠️ {_freestuff_rejected} message(s) rejected. Latest reason: {_freestuff_last_reject}."
+            )
+        embed.add_field(name="Webhook", value="\n".join(lines)[:1000], inline=False)
     embed.set_footer(text="Only you can see this panel. Requires the Manage Server permission.")
     return embed
 
@@ -2849,22 +2891,28 @@ async def freestuff_panel(interaction: discord.Interaction):
 @bot.listen("on_ready")
 async def _start_freestuff_alerts():
     """Load settings and start the webhook server once. Existing on_ready is unchanged."""
-    global _freestuff_started, _freestuff_key
+    global _freestuff_started, _freestuff_key, _freestuff_status
     if _freestuff_started:
         return
     _freestuff_started = True
     _load_freestuff_settings()
 
     if not FREESTUFF_PUBLIC_KEY:
-        print("[FreeStuff] FREESTUFF_PUBLIC_KEY is not set; the webhook is off. The /freestuff panel still works.")
+        _freestuff_status = "FREESTUFF_PUBLIC_KEY isn't set on this host."
+        print(f"[FreeStuff] {_freestuff_status} The /freestuff panel still works.")
         return
     if not _NACL_AVAILABLE:
-        print("[FreeStuff] pynacl is not installed (pip install pynacl); the webhook is off.")
+        _freestuff_status = "the pynacl package isn't installed (add it to requirements.txt)."
+        print(f"[FreeStuff] {_freestuff_status}")
         return
     try:
-        _freestuff_key = _load_freestuff_key(FREESTUFF_PUBLIC_KEY)
+        key = _load_freestuff_key(FREESTUFF_PUBLIC_KEY)
     except (ValueError, TypeError) as exc:
-        print(f"[FreeStuff] The public key couldn't be read ({exc}); the webhook is off.")
+        _freestuff_status = (
+            f"the public key couldn't be read ({exc}). Make sure FREESTUFF_PUBLIC_KEY "
+            "is the PUBLIC key from the FreeStuff dashboard, not the REST API key."
+        )
+        print(f"[FreeStuff] {_freestuff_status}")
         return
 
     app = web.Application()
@@ -2874,9 +2922,12 @@ async def _start_freestuff_alerts():
     try:
         await web.TCPSite(runner, "0.0.0.0", FREESTUFF_PORT).start()
     except OSError as exc:
-        print(f"[FreeStuff] Could not open port {FREESTUFF_PORT} ({exc}); the webhook is off.")
+        _freestuff_status = f"port {FREESTUFF_PORT} couldn't be opened on this host ({exc})."
+        print(f"[FreeStuff] {_freestuff_status}")
         await runner.cleanup()
         return
+    _freestuff_key = key  # set last, so the webhook only counts as "on" once the server is up
+    _freestuff_status = "running"
     print(f"[FreeStuff] Webhook server listening on port {FREESTUFF_PORT} at {FREESTUFF_WEBHOOK_PATH}")
 
 
