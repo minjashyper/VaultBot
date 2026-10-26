@@ -1117,17 +1117,19 @@ HELP_PAGES: list[dict] = [
     },
     {
         "key": "moderation",
-        "aliases": ("mod", "clear", "purge", "messages", "ban", "timeout"),
+        "aliases": ("mod", "clear", "purge", "messages", "ban", "timeout", "unban", "untimeout", "unmute"),
         "emoji": "🧹",
         "title": "Moderation Tools",
-        "summary": "Ban, timeout, and bulk-delete messages with permission checks",
+        "summary": "Ban, unban, timeout, remove timeouts, and bulk-delete messages",
         "color": BRAND_COLOR,
         "description": "Lightweight moderation tools for server staff.",
         "fields": [
             ("`~ban @member [reason]`  •  `~ban USER_ID [reason]`", "Bans a member by mention or numeric Discord user ID. The reason is optional."),
+            ("`~unban USER_ID`  •  `~unban @member`", "Removes a ban by Discord user ID or mention. The user does not need to be in the server."),
             ("`~timeout @member [duration] [reason]`  •  `~timeout USER_ID [duration] [reason]`", "Times out a current server member. Duration is optional and defaults to **10 minutes**. Examples: `10m`, `2h`, `1d`, `1w` (maximum 28 days)."),
+            ("`~untimeout @member`  •  `~untimeout USER_ID`", "Removes an active timeout from a current server member. Alias: `~unmute`."),
             ("`~clear [amount]`", "Deletes 1–100 recent messages, plus the command message. If no amount is supplied, it defaults to 100. Example: `~clear 25`."),
-            ("Permissions and limits", "You need **Ban Members** to ban or **Moderate Members** to timeout. VaultBot needs the matching permission too. Discord role hierarchy still applies: VaultBot cannot moderate members whose highest role is equal to or above its own."),
+            ("Permissions and limits", "Only the **server owner** or members with **Administrator** can use these moderation commands. VaultBot also needs **Ban Members** to ban/unban or **Moderate Members** to timeout/remove a timeout. Discord role hierarchy still applies."),
             ("Timeout duration examples", "`30s` = 30 seconds · `10m` = 10 minutes · `2h` = 2 hours · `1d` = 1 day · `1w` = 1 week. Maximum: 28 days."),
         ],
     },
@@ -1350,6 +1352,9 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CheckFailure) and ctx.command and ctx.command.name in {"ban", "unban", "timeout", "untimeout"}:
+        await ctx.send("❌ Only the **server owner** or a member with **Administrator** permission can use this command.")
         return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"Missing argument: `{error.param.name}`. Use `{PREFIX}help` to see examples.")
@@ -1793,6 +1798,109 @@ async def timeout_command(
                     f"**Moderator:** {ctx.author.mention}\n"
                     f"**Reason:** {final_reason[:900]}",
         color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=target_member.display_avatar.url)
+    embed.set_footer(text="VAULTBOT • Moderation")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="unban")
+@commands.guild_only()
+@commands.check(_is_server_owner_or_admin)
+async def unban_command(ctx: commands.Context, target: str, *, reason: str = "No reason provided"):
+    """Unban a user by mention or ID: ~unban USER_ID [reason]."""
+    guild = ctx.guild
+    if guild is None:
+        return
+    user_id = _parse_user_id(target)
+    if user_id is None:
+        await ctx.send(f"❌ Mention the user or provide their numeric ID. Example: `{PREFIX}unban 123456789012345678`")
+        return
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.ban_members:
+        await ctx.send("❌ I need the **Ban Members** permission to unban users.")
+        return
+    try:
+        ban_entry = await guild.fetch_ban(discord.Object(id=user_id))
+    except discord.NotFound:
+        await ctx.send("❌ That user is not banned from this server.")
+        return
+    except discord.Forbidden:
+        await ctx.send("❌ Discord denied the unban lookup. Check my **Ban Members** permission.")
+        return
+    except discord.HTTPException as error:
+        print(f"[UNBAN] Failed to look up {user_id}: {type(error).__name__}: {error}")
+        await ctx.send("❌ I couldn't check that ban. Please try again.")
+        return
+    try:
+        await guild.unban(ban_entry.user, reason=f"{ctx.author} ({ctx.author.id}): {reason[:400]}")
+    except discord.Forbidden:
+        await ctx.send("❌ Discord denied the unban. Check my permissions.")
+        return
+    except discord.HTTPException as error:
+        print(f"[UNBAN] Failed to unban {user_id}: {type(error).__name__}: {error}")
+        await ctx.send("❌ Discord couldn't complete the unban. Please try again.")
+        return
+    embed = discord.Embed(
+        title="🔓 User Unbanned",
+        description=f"**User:** {ban_entry.user.mention}\n**User ID:** `{user_id}`\n**Moderator:** {ctx.author.mention}\n**Reason:** {reason[:900]}",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=ban_entry.user.display_avatar.url)
+    embed.set_footer(text="VAULTBOT • Moderation")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="untimeout", aliases=["unmute"])
+@commands.guild_only()
+@commands.check(_is_server_owner_or_admin)
+async def untimeout_command(ctx: commands.Context, target: str, *, reason: str = "No reason provided"):
+    """Remove a member timeout by mention or ID: ~untimeout @member [reason]."""
+    guild = ctx.guild
+    if guild is None:
+        return
+    user_id = _parse_user_id(target)
+    if user_id is None:
+        await ctx.send(f"❌ Mention a server member or provide their numeric ID. Example: `{PREFIX}untimeout @member` ")
+        return
+    if user_id == ctx.author.id:
+        await ctx.send("❌ You can't remove your own timeout using this command.")
+        return
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.moderate_members:
+        await ctx.send("❌ I need the **Moderate Members** permission to remove timeouts.")
+        return
+    target_member = await _resolve_guild_member(guild, user_id)
+    if target_member is None:
+        await ctx.send("❌ I couldn't find that member in this server. They must be a current member.")
+        return
+    if target_member.id == guild.owner_id:
+        await ctx.send("❌ The server owner cannot be timed out.")
+        return
+    if target_member.top_role >= bot_member.top_role:
+        await ctx.send("❌ I can't remove that timeout because their highest role is equal to or above mine.")
+        return
+    if target_member.top_role >= ctx.author.top_role and ctx.author.id != guild.owner_id:
+        await ctx.send("❌ You can't moderate a member whose highest role is equal to or above yours.")
+        return
+    if target_member.timed_out_until is None or target_member.timed_out_until <= datetime.now(timezone.utc):
+        await ctx.send(f"ℹ️ {target_member.mention} doesn't currently have an active timeout.")
+        return
+    try:
+        await target_member.timeout(None, reason=f"{ctx.author} ({ctx.author.id}): {reason[:400]}")
+    except discord.Forbidden:
+        await ctx.send("❌ Discord denied the timeout removal. Check my permissions and role position.")
+        return
+    except discord.HTTPException as error:
+        print(f"[UNTIMEOUT] Failed to remove timeout for {user_id}: {type(error).__name__}: {error}")
+        await ctx.send("❌ Discord couldn't remove that timeout. Please try again.")
+        return
+    embed = discord.Embed(
+        title="✅ Timeout Removed",
+        description=f"**User:** {target_member.mention}\n**Moderator:** {ctx.author.mention}\n**Reason:** {reason[:900]}",
+        color=discord.Color.green(),
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_thumbnail(url=target_member.display_avatar.url)
