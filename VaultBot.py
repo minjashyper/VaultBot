@@ -4464,20 +4464,26 @@ def _drops_parse_feed(raw: bytes) -> list:
                 if label:
                     categories.append(label)
             elif name in ("title", "guid", "id", "description", "summary", "content",
-                          "pubdate", "published", "updated") and name not in fields:
+                          "pubdate", "published", "updated", "creator") and name not in fields:
                 fields[name] = text
 
         title = fields.get("title") or "New Twitch Drops campaign"
         entry_id = fields.get("guid") or fields.get("id") or link or title
         summary = fields.get("description") or fields.get("summary") or fields.get("content") or ""
         stamp = _drops_date(fields.get("pubdate") or fields.get("published") or fields.get("updated") or "")
+        # ttvdrops puts the game in <dc:creator>; other feeds may only have categories.
+        generic = {"twitch", "drops", "kick", "chzzk", "youtube"}
+        game = fields.get("creator") or next(
+            (c for c in categories if c.lower() not in generic), "") or title
+        image_match = re.search(r'<img[^>]+src="(https://[^"]+)"', html.unescape(summary))
         entries.append({
             "id": str(entry_id),
             "title": title,
             "link": link if link.startswith(("https://", "http://")) else "",
             "summary": summary,
             "categories": categories,
-            "game": categories[0] if categories else title,
+            "game": game,
+            "image": image_match.group(1) if image_match else "",
             "date": stamp,
         })
     entries.sort(key=lambda e: e["date"] or 0, reverse=True)
@@ -4503,7 +4509,9 @@ def _drops_matches(entry: dict, games: list) -> bool:
         return False
     if _DROPS_ALL in games:
         return True
-    haystack = " ".join([entry["title"], " ".join(entry["categories"]), entry["summary"]]).lower()
+    # Title, game and categories only. The description is left out on purpose:
+    # it contains channel lists and prose that cause false matches.
+    haystack = " ".join([entry["title"], entry.get("game", ""), " ".join(entry["categories"])]).lower()
     for game in games:
         if re.search(rf"(?<![a-z0-9]){re.escape(game)}(?![a-z0-9])", haystack):
             return True
@@ -4526,6 +4534,8 @@ def _drops_build(entry: dict, note: Optional[str] = None) -> tuple:
     embed.add_field(name="Game", value=_drops_safe(entry.get("game"), 200) or "Unknown", inline=True)
     if note:
         embed.add_field(name="Details", value=_drops_safe(note, 1000), inline=False)
+    if entry.get("image", "").startswith("https://"):
+        embed.set_thumbnail(url=entry["image"])
     if entry.get("date"):
         embed.timestamp = datetime.fromtimestamp(entry["date"], tz=timezone.utc)
     embed.set_footer(text="Twitch Drops alert • community tracker feed")
