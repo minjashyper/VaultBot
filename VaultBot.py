@@ -607,10 +607,8 @@ _juicewrld_baseline_initialized = False
 def _load_juicewrld_state() -> None:
     """Load persisted event IDs once, so restarts do not repost old events."""
     global _juicewrld_state_loaded, _juicewrld_baseline_initialized
-
     if _juicewrld_state_loaded:
         return
-
     _juicewrld_state_loaded = True
     try:
         data = json.loads(JUICEWRLD_STATE_FILE.read_text(encoding="utf-8"))
@@ -620,7 +618,7 @@ def _load_juicewrld_state() -> None:
             _juicewrld_baseline_initialized = True
         print(f"[JuiceWRLD] Loaded {len(_juicewrld_seen)} saved tracker event(s).")
     except FileNotFoundError:
-        # A new install establishes a baseline and skips historical events.
+        # First run records a baseline and skips historical events.
         _juicewrld_baseline_initialized = False
     except (OSError, json.JSONDecodeError, AttributeError) as exc:
         print(f"[JuiceWRLD] Could not load state file: {exc}")
@@ -630,12 +628,10 @@ def _load_juicewrld_state() -> None:
 def _save_juicewrld_state() -> None:
     """Write tracker state atomically to reduce corruption on a restart."""
     JUICEWRLD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = JUICEWRLD_STATE_FILE.with_suffix(
-        JUICEWRLD_STATE_FILE.suffix + ".tmp"
-    )
+    temporary_path = JUICEWRLD_STATE_FILE.with_suffix(JUICEWRLD_STATE_FILE.suffix + ".tmp")
     temporary_path.write_text(
         json.dumps({"seen": sorted(_juicewrld_seen)}, ensure_ascii=False),
-        encoding="utf-8"
+        encoding="utf-8",
     )
     temporary_path.replace(JUICEWRLD_STATE_FILE)
 
@@ -645,11 +641,9 @@ async def _juicewrld_api_get(path: str, params: Optional[dict] = None):
     headers = {"Accept": "application/json"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
-
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(
-            f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}",
-            params=params
+            f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
         ) as response:
             response.raise_for_status()
             return await response.json(content_type=None)
@@ -673,16 +667,88 @@ def _juicewrld_safe(value, fallback="Unknown", limit=250):
     text = str(value).strip()
     if not text:
         return fallback
-    # Prevent accidental mass mentions in third-party API text.
-    text = text.replace("@", "@\u200b")
-    return text[:limit]
+    return text.replace("@", "@\u200b")[:limit]
+
+
+def _juicewrld_embed_timestamp(embed: discord.Embed, item: dict) -> None:
+    timestamp = item.get("timestamp") or item.get("created_at") or item.get("created")
+    if not timestamp:
+        return
+    try:
+        embed.timestamp = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        pass
+
+
+def _juicewrld_safe_link(value) -> Optional[str]:
+    """Only allow links hosted by JuiceWRLD API domains."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "https" and (
+            host == "juicewrldapi.com" or host.endswith(".juicewrldapi.com")
+        ):
+            return value.strip()
+    except ValueError:
+        pass
+    return None
+
+
+def _juicewrld_event_song_id(item: dict):
+    for key in ("song_id", "catalog_id", "track_id", "song"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            value = value.get("id")
+        if value is not None and str(value).isdigit():
+            return int(value)
+    return None
+
+
+async def _juicewrld_song_detail_for_event(item: dict) -> Optional[dict]:
+    song_id = _juicewrld_event_song_id(item)
+    if song_id is None:
+        return None
+    try:
+        payload = await _juicewrld_api_get(f"/songs/{song_id}/")
+        return payload if isinstance(payload, dict) else None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Could not load details for new catalog entry {song_id}: {exc}")
+        return None
+
+
+def _juicewrld_add_event_metadata(embed: discord.Embed, item: dict) -> None:
+    """Add concise event metadata while respecting Discord embed limits."""
+    field_map = (
+        ("Category", ("category", "type")),
+        ("Added by", ("user", "added_by", "created_by")),
+        ("Producers", ("producers",)),
+        ("Engineers", ("engineers",)),
+        ("Leak info", ("date_leaked", "leak_type")),
+        ("Alternate titles", ("track_titles", "alternate_titles")),
+    )
+    for label, keys in field_map:
+        values = []
+        for key in keys:
+            value = item.get(key)
+            if value is None or value == "":
+                continue
+            if isinstance(value, list):
+                value = ", ".join(str(part) for part in value if part is not None)
+            elif isinstance(value, dict):
+                value = ", ".join(f"{k}: {v}" for k, v in value.items() if v is not None)
+            value = _juicewrld_safe(value, "", 900)
+            if value:
+                values.append(value)
+        if values and len(embed.fields) < 24:
+            embed.add_field(name=label, value="\n".join(values)[:1000], inline=False)
 
 
 @tasks.loop(minutes=JUICEWRLD_POLL_MINUTES)
 async def juicewrld_tracker_task():
-    """Poll the API tracker feed and post unseen events to the configured channel."""
+    """Poll the tracker feed and post polished updates plus distinct new-song alerts."""
     global _juicewrld_baseline_initialized
-
     if not JUICEWRLD_CHANNEL_ID:
         return
 
@@ -691,29 +757,24 @@ async def juicewrld_tracker_task():
         channel = bot.get_channel(channel_id)
         if channel is None:
             channel = await bot.fetch_channel(channel_id)
-
         if not hasattr(channel, "send"):
             print("[JuiceWRLD] Configured channel cannot receive messages.")
             return
 
-        payload = await _juicewrld_api_get(
-            "/feeds/tracker.json",
-            params={"limit": 50}
-        )
+        payload = await _juicewrld_api_get("/feeds/tracker.json", params={"limit": 50})
         updates = _juicewrld_items(payload)
 
         if not _juicewrld_baseline_initialized:
             for item in updates:
-                if not isinstance(item, dict):
-                    continue
-                event_id = item.get("id", item.get("proposal_id"))
-                if event_id is not None:
-                    _juicewrld_seen.add(str(event_id))
+                if isinstance(item, dict):
+                    event_id = item.get("id", item.get("proposal_id"))
+                    if event_id is not None:
+                        _juicewrld_seen.add(str(event_id))
             _save_juicewrld_state()
             _juicewrld_baseline_initialized = True
             print(
-                f"[JuiceWRLD] Baseline initialized with "
-                f"{len(_juicewrld_seen)} existing event(s); old events skipped."
+                f"[JuiceWRLD] Baseline initialized with {len(_juicewrld_seen)} existing event(s); "
+                "old events skipped."
             )
             return
 
@@ -725,62 +786,65 @@ async def juicewrld_tracker_task():
             if event_id is not None and str(event_id) not in _juicewrld_seen:
                 fresh.append((str(event_id), item))
 
-        # Feeds are commonly newest-first; send oldest unseen event first.
+        # Tracker feeds are usually newest-first; publish oldest unseen event first.
         for event_id, item in reversed(fresh):
-            title = _juicewrld_safe(item.get("name"), "Song tracker update", 200)
-            action = _juicewrld_safe(item.get("action"), "Updated", 100)
-            editor = _juicewrld_safe(item.get("user"), "Unknown", 100)
+            title = _juicewrld_safe(item.get("name") or item.get("title"), "Untitled song", 200)
+            action_raw = str(item.get("action") or "update").strip().lower()
+            is_new_song = action_raw in {"create", "created", "new", "add", "added"}
+            editor = _juicewrld_safe(item.get("user") or item.get("added_by"), "Unknown", 100)
+            link = _juicewrld_safe_link(item.get("link") or item.get("url"))
 
-            embed = discord.Embed(
-                title=f"🎵 Juice WRLD Tracker Update: {title}",
-                description=f"**Action:** {action}\n**Updated by:** {editor}",
-                color=JUICE_COLOR
-            )
-
-            changed_fields = item.get("fields")
-            if isinstance(changed_fields, list) and changed_fields:
-                embed.add_field(
-                    name="Changed fields",
-                    value=", ".join(
-                        _juicewrld_safe(field, limit=100)
-                        for field in changed_fields
-                    )[:1000],
-                    inline=False
+            if is_new_song:
+                embed = discord.Embed(
+                    title=f"✦ JUICE WRLD // NEW CATALOG ENTRY",
+                    description=f"## ◈ {title}\n**NEW SONG ADDED** · Catalog database event",
+                    color=discord.Color.from_rgb(0, 220, 210),
+                    url=link,
                 )
-
-            notes = item.get("notes")
-            if notes:
-                embed.add_field(
-                    name="Notes",
-                    value=_juicewrld_safe(notes, limit=1000),
-                    inline=False
+                detail = await _juicewrld_song_detail_for_event(item)
+                combined = dict(item)
+                if detail:
+                    combined.update(detail)
+                    title = _juicewrld_safe(detail.get("name") or detail.get("title") or title, title, 200)
+                    embed.description = f"## ◈ {title}\n**NEW SONG ADDED** · Fresh catalog entry"
+                    image_url = detail.get("image_url") or detail.get("artwork_url")
+                    if isinstance(image_url, str) and image_url.strip():
+                        if image_url.startswith("/"):
+                            image_url = "https://juicewrldapi.com" + image_url
+                        if image_url.startswith("https://") or image_url.startswith("http://"):
+                            embed.set_thumbnail(url=image_url)
+                _juicewrld_add_event_metadata(embed, combined)
+                catalog_id = combined.get("public_id") or combined.get("song_id") or combined.get("id")
+                if catalog_id is not None and len(embed.fields) < 25:
+                    embed.add_field(name="Catalog ID", value=_juicewrld_safe(catalog_id, "Unknown", 100), inline=True)
+                embed.set_footer(text="JUICEWRLDAPI.COM • New catalog entry detected")
+                print(f"[JuiceWRLD] New-song event detected: {title}")
+            else:
+                embed = discord.Embed(
+                    title=f"◈ JUICE WRLD // TRACKER UPDATE",
+                    description=f"**{title}**\n`UPDATE`  ·  {action_raw.upper()}",
+                    color=JUICE_COLOR,
+                    url=link,
                 )
-
-            timestamp = item.get("timestamp")
-            if timestamp:
-                try:
-                    parsed = datetime.fromisoformat(
-                        str(timestamp).replace("Z", "+00:00")
+                embed.add_field(name="◈ ACTION", value=_juicewrld_safe(item.get("action"), "Update", 100), inline=True)
+                embed.add_field(name="◈ EDITED BY", value=editor, inline=True)
+                song_id = _juicewrld_event_song_id(item)
+                if song_id is not None:
+                    embed.add_field(name="◈ SONG ID", value=str(song_id), inline=True)
+                changed_fields = item.get("fields") or item.get("changed_fields")
+                if isinstance(changed_fields, list) and changed_fields:
+                    embed.add_field(
+                        name="◇ FIELDS CHANGED",
+                        value=", ".join(_juicewrld_safe(field, limit=100) for field in changed_fields)[:1000],
+                        inline=False,
                     )
-                    embed.timestamp = parsed
-                except (ValueError, TypeError):
-                    pass
+                notes = item.get("notes")
+                if notes:
+                    embed.add_field(name="◇ NOTES", value=_juicewrld_safe(notes, limit=1000), inline=False)
+                embed.set_footer(text="juicewrldapi.com • Tracker event, not necessarily a new release")
 
-            link = item.get("link")
-            if (
-                isinstance(link, str)
-                and link.startswith("https://juicewrldapi.com/")
-            ):
-                embed.url = link
-
-            embed.set_footer(
-                text="Juice WRLD API • Tracker event (not necessarily a new release)"
-            )
-
-            await channel.send(
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions.none()
-            )
+            _juicewrld_embed_timestamp(embed, item)
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             _juicewrld_seen.add(event_id)
             _save_juicewrld_state()
             print(f"[JuiceWRLD] Posted tracker event {event_id}: {title}")
@@ -946,10 +1010,11 @@ HELP_PAGES: list[dict] = [
             ),
             (
                 "📡 Automatic Tracker Feed",
-                "When the bot owner picks a channel for it, VaultBot checks the "
-                "tracker on a timer and posts every new update: the song name, "
-                "what happened, who updated it, which fields changed, and any "
-                "notes.\n"
+                "When the tracker channel is configured, VaultBot posts futuristic "
+                "cards for tracker changes and a distinct cyan alert when the API "
+                "marks a catalog entry as created. Update cards show the action, "
+                "editor, changed fields, and notes when available. New-song cards "
+                "include available catalog metadata and artwork.\n"
                 "*A tracker update isn't necessarily a new release.*",
             ),
         ],
