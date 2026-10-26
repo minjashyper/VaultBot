@@ -41,7 +41,7 @@ import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlencode
@@ -1117,15 +1117,18 @@ HELP_PAGES: list[dict] = [
     },
     {
         "key": "moderation",
-        "aliases": ("mod", "clear", "purge", "messages"),
+        "aliases": ("mod", "clear", "purge", "messages", "ban", "timeout"),
         "emoji": "🧹",
         "title": "Moderation Tools",
-        "summary": "Bulk-delete recent messages with permission checks",
+        "summary": "Ban, timeout, and bulk-delete messages with permission checks",
         "color": BRAND_COLOR,
-        "description": "A lightweight message cleanup tool for server staff.",
+        "description": "Lightweight moderation tools for server staff.",
         "fields": [
+            ("`~ban @member [reason]`  •  `~ban USER_ID [reason]`", "Bans a member by mention or numeric Discord user ID. The reason is optional."),
+            ("`~timeout @member [duration] [reason]`  •  `~timeout USER_ID [duration] [reason]`", "Times out a current server member. Duration is optional and defaults to **10 minutes**. Examples: `10m`, `2h`, `1d`, `1w` (maximum 28 days)."),
             ("`~clear [amount]`", "Deletes 1–100 recent messages, plus the command message. If no amount is supplied, it defaults to 100. Example: `~clear 25`."),
-            ("Permissions and limits", "The person running the command needs **Manage Messages**. VaultBot also needs **Manage Messages** and **Read Message History** in that specific channel. Discord's bulk-delete limits still apply, including restrictions on older messages."),
+            ("Permissions and limits", "You need **Ban Members** to ban or **Moderate Members** to timeout. VaultBot needs the matching permission too. Discord role hierarchy still applies: VaultBot cannot moderate members whose highest role is equal to or above its own."),
+            ("Timeout duration examples", "`30s` = 30 seconds · `10m` = 10 minutes · `2h` = 2 hours · `1d` = 1 day · `1w` = 1 week. Maximum: 28 days."),
         ],
     },
     {
@@ -1568,6 +1571,232 @@ async def profile_command(ctx: commands.Context, member: Optional[discord.Member
         role_text = "No roles"
     embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=role_text[:1024], inline=False)
     embed.set_footer(text="VAULTBOT • Member history tracked from feature installation")
+    await ctx.send(embed=embed)
+
+
+# ---- Moderation ----
+
+def _is_server_owner_or_admin(ctx: commands.Context) -> bool:
+    """Only the server owner or a member with Administrator may use mod commands."""
+    return bool(
+        ctx.guild is not None
+        and (ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator)
+    )
+
+
+def _parse_user_id(raw_target: str) -> Optional[int]:
+    """Accept a numeric user ID or a standard Discord user mention."""
+    raw_target = raw_target.strip()
+    match = re.fullmatch(r"<@!?(\d+)>", raw_target)
+    if match:
+        return int(match.group(1))
+    if raw_target.isdigit():
+        return int(raw_target)
+    return None
+
+
+def _parse_timeout_duration(raw_duration: str) -> Optional[timedelta]:
+    """Parse compact timeout durations such as 30s, 10m, 2h, 1d, or 1w."""
+    match = re.fullmatch(r"(\d+)\s*([smhdw])", raw_duration.strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    seconds_per_unit = {
+        "s": 1,
+        "m": 60,
+        "h": 60 * 60,
+        "d": 24 * 60 * 60,
+        "w": 7 * 24 * 60 * 60,
+    }
+    if amount < 1:
+        return None
+    duration = timedelta(seconds=amount * seconds_per_unit[unit])
+    if duration > timedelta(days=28):
+        return None
+    return duration
+
+
+async def _resolve_guild_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+    """Resolve a member from cache first, then the API if needed."""
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except discord.NotFound:
+        return None
+    except discord.HTTPException:
+        return None
+
+
+@bot.command(name="ban")
+@commands.guild_only()
+@commands.check(_is_server_owner_or_admin)
+async def ban_command(ctx: commands.Context, target: str, *, reason: str = "No reason provided"):
+    """Ban a user by mention or ID: ~ban @member [reason] or ~ban USER_ID [reason]."""
+    guild = ctx.guild
+    if guild is None:
+        return
+
+    user_id = _parse_user_id(target)
+    if user_id is None:
+        await ctx.send(f"❌ Mention a user or provide their numeric ID. Example: `{PREFIX}ban @member spam`")
+        return
+    if user_id == ctx.author.id:
+        await ctx.send("❌ You can't ban yourself.")
+        return
+    if user_id == bot.user.id:
+        await ctx.send("❌ I can't ban myself.")
+        return
+    if guild.owner_id == user_id:
+        await ctx.send("❌ The server owner can't be banned by a bot command.")
+        return
+
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.ban_members:
+        await ctx.send("❌ I need the **Ban Members** permission to do that.")
+        return
+
+    target_member = await _resolve_guild_member(guild, user_id)
+    if target_member is not None:
+        if target_member.top_role >= bot_member.top_role:
+            await ctx.send("❌ I can't ban that member because their highest role is equal to or above mine.")
+            return
+        if target_member.top_role >= ctx.author.top_role and ctx.author.id != guild.owner_id:
+            await ctx.send("❌ You can't ban a member whose highest role is equal to or above yours.")
+            return
+        user = target_member
+    else:
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.NotFound:
+            await ctx.send("❌ I couldn't find a Discord user with that ID.")
+            return
+        except discord.HTTPException:
+            await ctx.send("❌ I couldn't look up that user. Please try again.")
+            return
+
+    try:
+        await guild.ban(user, reason=f"{ctx.author} ({ctx.author.id}): {reason[:400]}")
+    except discord.Forbidden:
+        await ctx.send("❌ Discord denied the ban. Check my permissions and role position.")
+        return
+    except discord.HTTPException as error:
+        print(f"[BAN] Failed to ban {user_id}: {type(error).__name__}: {error}")
+        await ctx.send("❌ Discord couldn't complete the ban. Please try again.")
+        return
+
+    embed = discord.Embed(
+        title="🔨 Member Banned",
+        description=f"**User:** {user.mention if isinstance(user, discord.Member) else f'<@{user.id}>'}\n"
+                    f"**User ID:** `{user.id}`\n"
+                    f"**Moderator:** {ctx.author.mention}\n"
+                    f"**Reason:** {reason[:900]}",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url if isinstance(user, discord.Member) else user.display_avatar.url)
+    embed.set_footer(text="VAULTBOT • Moderation")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="timeout", aliases=["mute"])
+@commands.guild_only()
+@commands.check(_is_server_owner_or_admin)
+async def timeout_command(
+    ctx: commands.Context,
+    target: str,
+    duration_or_reason: Optional[str] = None,
+    *,
+    reason: str = "",
+):
+    """Timeout a member by mention or ID; duration defaults to 10 minutes."""
+    guild = ctx.guild
+    if guild is None:
+        return
+
+    user_id = _parse_user_id(target)
+    if user_id is None:
+        await ctx.send(f"❌ Mention a server member or provide their numeric ID. Example: `{PREFIX}timeout @member 10m spamming`")
+        return
+
+    duration = timedelta(minutes=10)
+    final_reason = "No reason provided"
+
+    # If the second argument looks like a duration, treat it as such.
+    # Otherwise, treat it and the remaining text as the reason.
+    if duration_or_reason:
+        parsed_duration = _parse_timeout_duration(duration_or_reason)
+        if parsed_duration is not None:
+            duration = parsed_duration
+            final_reason = reason.strip() or "No reason provided"
+        elif re.fullmatch(r"\d+\s*[smhdw]", duration_or_reason.strip().lower()):
+            await ctx.send("❌ Timeout duration must be between 1 second and 28 days (examples: `10m`, `2h`, `1d`).")
+            return
+        else:
+            final_reason = " ".join(part for part in (duration_or_reason, reason) if part).strip()
+
+    if user_id == ctx.author.id:
+        await ctx.send("❌ You can't timeout yourself.")
+        return
+    if user_id == bot.user.id:
+        await ctx.send("❌ I can't timeout myself.")
+        return
+    if guild.owner_id == user_id:
+        await ctx.send("❌ The server owner can't be timed out.")
+        return
+
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.moderate_members:
+        await ctx.send("❌ I need the **Moderate Members** permission to do that.")
+        return
+
+    target_member = await _resolve_guild_member(guild, user_id)
+    if target_member is None:
+        await ctx.send("❌ I couldn't find that member in this server. Timeouts only work on current server members.")
+        return
+    if target_member.top_role >= bot_member.top_role:
+        await ctx.send("❌ I can't timeout that member because their highest role is equal to or above mine.")
+        return
+    if target_member.top_role >= ctx.author.top_role and ctx.author.id != guild.owner_id:
+        await ctx.send("❌ You can't timeout a member whose highest role is equal to or above yours.")
+        return
+
+    try:
+        until = datetime.now(timezone.utc) + duration
+        await target_member.timeout(until, reason=f"{ctx.author} ({ctx.author.id}): {final_reason[:400]}")
+    except discord.Forbidden:
+        await ctx.send("❌ Discord denied the timeout. Check my permissions and role position.")
+        return
+    except discord.HTTPException as error:
+        print(f"[TIMEOUT] Failed to timeout {user_id}: {type(error).__name__}: {error}")
+        await ctx.send("❌ Discord couldn't complete the timeout. Please try again.")
+        return
+
+    total_seconds = int(duration.total_seconds())
+    if total_seconds % 604800 == 0:
+        duration_label = f"{total_seconds // 604800} week(s)"
+    elif total_seconds % 86400 == 0:
+        duration_label = f"{total_seconds // 86400} day(s)"
+    elif total_seconds % 3600 == 0:
+        duration_label = f"{total_seconds // 3600} hour(s)"
+    elif total_seconds % 60 == 0:
+        duration_label = f"{total_seconds // 60} minute(s)"
+    else:
+        duration_label = f"{total_seconds} second(s)"
+
+    embed = discord.Embed(
+        title="⏳ Member Timed Out",
+        description=f"**User:** {target_member.mention}\n"
+                    f"**Duration:** {duration_label}\n"
+                    f"**Moderator:** {ctx.author.mention}\n"
+                    f"**Reason:** {final_reason[:900]}",
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=target_member.display_avatar.url)
+    embed.set_footer(text="VAULTBOT • Moderation")
     await ctx.send(embed=embed)
 
 
