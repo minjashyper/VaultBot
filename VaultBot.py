@@ -714,7 +714,7 @@ async def _juicewrld_song_detail_for_event(item: dict) -> Optional[dict]:
         payload = await _juicewrld_api_get(f"/songs/{song_id}/")
         return payload if isinstance(payload, dict) else None
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
-        print(f"[JuiceWRLD] Could not load details for new catalog entry {song_id}: {exc}")
+        print(f"[JuiceWRLD] Could not load details for new catalog entry {song_id}: {exc!r}")
         return None
 
 
@@ -852,9 +852,11 @@ async def juicewrld_tracker_task():
     except asyncio.CancelledError:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        print(f"[JuiceWRLD] API request failed: {exc}")
+        print(f"[JuiceWRLD] API request failed: {exc!r}")
     except (ValueError, discord.HTTPException, OSError, TypeError) as exc:
-        print(f"[JuiceWRLD] Tracker task failed: {exc}")
+        print(f"[JuiceWRLD] Tracker task failed: {exc!r}")
+    except Exception as exc:  # keep the tracker alive: an unexpected error must not stop future polls
+        print(f"[JuiceWRLD] Unexpected tracker error: {type(exc).__name__}: {exc!r}")
 
 
 @juicewrld_tracker_task.before_loop
@@ -1452,6 +1454,10 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
     diag(f"~play received: {query[:80]!r}")
+    if not query.strip() and not ctx.message.attachments:
+        return await ctx.send(
+            f"Usage: `{PREFIX}play song name or URL` — or attach an audio file to `{PREFIX}play`."
+        )
     try:
         await ensure_voice(ctx)
     except Exception as exc:
@@ -4198,7 +4204,7 @@ async def poll_once() -> None:
         try:
             items = await _fetch_items(appid)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-            print(f"[PatchNotes] Lookup failed for {appid}: {exc}")
+            print(f"[PatchNotes] Lookup failed for {appid}: {exc!r}")
             continue
 
         if appid not in _seen:       # first time we see this game: just remember what's there
