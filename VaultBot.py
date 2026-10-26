@@ -1322,6 +1322,14 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # XP tracking is separate from existing auto-replies and command handling.
+    # Prefix commands are intentionally excluded from XP farming.
+    if message.guild and not message.content.startswith(PREFIX):
+        try:
+            await _xp_process_message(message)
+        except Exception as error:
+            print(f"[XP] Message tracking failed: {type(error).__name__}: {error}")
+
     # Commands are handled normally and never get an auto-reply.
     if message.content.startswith(PREFIX):
         await bot.process_commands(message)
@@ -4951,6 +4959,495 @@ def _install_drops() -> None:
 
 
 _install_drops()
+
+
+# =============================================================================
+# 12e. XP, LEVELS, ACHIEVEMENTS & INTERACTIVE LEADERBOARDS
+# =============================================================================
+# Additive module: uses SQLite and the existing discord.py bot/tree.
+import sqlite3
+from datetime import datetime, timezone, timedelta
+
+XP_DB_PATH = Path(os.getenv("VAULTBOT_XP_DB", str(Path(__file__).with_name("vaultbot_xp.sqlite3"))))
+XP_DEFAULTS = {
+    "enabled": 1,
+    "xp_min": 15,
+    "xp_max": 25,
+    "cooldown": 60,
+    "levelup_enabled": 1,
+    "levelup_channel_id": 0,
+    "ignored_channels": "",
+    "ignored_roles": "",
+    "voice_enabled": 0,
+    "announcement_text": "✨ {member} reached **Level {level}**!",
+}
+XP_COLOR = discord.Color.from_rgb(112, 78, 190)
+XP_ACHIEVEMENTS = {
+    "first_message": {"name": "First Steps", "description": "Send your first eligible message.", "icon": "👋", "kind": "messages", "target": 1, "rarity": "Common"},
+    "chatterbox": {"name": "Chatterbox", "description": "Send 100 eligible messages.", "icon": "💬", "kind": "messages", "target": 100, "rarity": "Common"},
+    "social_regular": {"name": "Social Regular", "description": "Be active on 7 different days.", "icon": "📅", "kind": "days", "target": 7, "rarity": "Uncommon"},
+    "rising_star": {"name": "Rising Star", "description": "Reach level 10.", "icon": "🌟", "kind": "level", "target": 10, "rarity": "Uncommon"},
+    "dedicated": {"name": "Dedicated", "description": "Reach level 25.", "icon": "💎", "kind": "level", "target": 25, "rarity": "Rare"},
+    "veteran": {"name": "Veteran", "description": "Reach level 50.", "icon": "🏆", "kind": "level", "target": 50, "rarity": "Epic"},
+    "legend": {"name": "Legend", "description": "Reach level 100.", "icon": "👑", "kind": "level", "target": 100, "rarity": "Legendary"},
+    "collector": {"name": "Collector", "description": "Unlock 10 achievements.", "icon": "🗃️", "kind": "achievements", "target": 10, "rarity": "Rare"},
+}
+_xp_last_award: dict[tuple[int, int], float] = {}
+_xp_voice_awarded: dict[tuple[int, int], float] = {}
+
+
+def _xp_connect():
+    XP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(XP_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _xp_init_db():
+    with _xp_connect() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS xp_profiles (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            total_xp INTEGER NOT NULL DEFAULT 0, messages INTEGER NOT NULL DEFAULT 0,
+            active_days INTEGER NOT NULL DEFAULT 0, last_active_day TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (guild_id, user_id));
+        CREATE TABLE IF NOT EXISTS xp_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL, amount INTEGER NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS xp_events_guild_date ON xp_events(guild_id, created_at);
+        CREATE TABLE IF NOT EXISTS xp_achievements (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, achievement_key TEXT NOT NULL,
+            unlocked_at TEXT NOT NULL, PRIMARY KEY (guild_id, user_id, achievement_key));
+        CREATE TABLE IF NOT EXISTS xp_settings (
+            guild_id INTEGER PRIMARY KEY, settings_json TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS xp_level_rewards (
+            guild_id INTEGER NOT NULL, level INTEGER NOT NULL, role_id INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, level));
+        """)
+
+
+def _xp_settings(guild_id: int) -> dict:
+    with _xp_connect() as db:
+        row = db.execute("SELECT settings_json FROM xp_settings WHERE guild_id=?", (guild_id,)).fetchone()
+    settings = dict(XP_DEFAULTS)
+    if row:
+        try:
+            settings.update(json.loads(row["settings_json"]))
+        except (ValueError, TypeError):
+            pass
+    return settings
+
+
+def _xp_save_settings(guild_id: int, settings: dict) -> None:
+    with _xp_connect() as db:
+        db.execute("INSERT INTO xp_settings(guild_id,settings_json) VALUES(?,?) ON CONFLICT(guild_id) DO UPDATE SET settings_json=excluded.settings_json",
+                   (guild_id, json.dumps(settings)))
+
+
+def _xp_level(total_xp: int) -> int:
+    # Level N requires 100*N*(N+1)/2 total XP; level 1 begins at 100 XP.
+    level = 0
+    while total_xp >= 100 * (level + 1) * (level + 2) // 2:
+        level += 1
+    return level
+
+
+def _xp_level_progress(total_xp: int) -> tuple[int, int, int]:
+    level = _xp_level(total_xp)
+    current_floor = 100 * level * (level + 1) // 2
+    next_floor = 100 * (level + 1) * (level + 2) // 2
+    return level, total_xp - current_floor, max(1, next_floor - current_floor)
+
+
+def _xp_unlock(db, guild_id: int, user_id: int, key: str) -> bool:
+    if key not in XP_ACHIEVEMENTS:
+        return False
+    cur = db.execute("INSERT OR IGNORE INTO xp_achievements(guild_id,user_id,achievement_key,unlocked_at) VALUES(?,?,?,?)",
+                      (guild_id, user_id, key, datetime.now(timezone.utc).isoformat()))
+    return cur.rowcount > 0
+
+
+def _xp_check_achievements(db, guild_id: int, user_id: int, total_xp: int, messages: int, active_days: int) -> list[str]:
+    level = _xp_level(total_xp)
+    earned = []
+    for key, item in XP_ACHIEVEMENTS.items():
+        value = {"messages": messages, "days": active_days, "level": level}.get(item["kind"], 0)
+        if item["kind"] == "achievements":
+            value = db.execute("SELECT COUNT(*) FROM xp_achievements WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()[0]
+        if value >= item["target"] and _xp_unlock(db, guild_id, user_id, key):
+            earned.append(key)
+    return earned
+
+
+async def _xp_process_message(message: discord.Message):
+    if not message.guild or message.author.bot or message.webhook_id or message.author.system:
+        return
+    if message.content.startswith(PREFIX):
+        return
+    guild_id, user_id = message.guild.id, message.author.id
+    settings = _xp_settings(guild_id)
+    if not settings.get("enabled", 1):
+        return
+    try:
+        ignored_channels = {int(x) for x in str(settings.get("ignored_channels", "")).split(",") if x.strip()}
+        ignored_roles = {int(x) for x in str(settings.get("ignored_roles", "")).split(",") if x.strip()}
+    except ValueError:
+        ignored_channels, ignored_roles = set(), set()
+    if message.channel.id in ignored_channels or any(r.id in ignored_roles for r in getattr(message.author, "roles", [])):
+        return
+    now = time.time()
+    cooldown_key = (guild_id, user_id)
+    if now - _xp_last_award.get(cooldown_key, 0) < max(1, int(settings.get("cooldown", 60))):
+        # Count message statistics only for eligible chat, not every rapid message.
+        return
+    _xp_last_award[cooldown_key] = now
+    amount = random.randint(max(0, int(settings.get("xp_min", 15))), max(0, int(settings.get("xp_max", 25))))
+    today = datetime.now(timezone.utc).date().isoformat()
+    unlocked = []
+    with _xp_connect() as db:
+        row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()
+        old_xp = int(row["total_xp"]) if row else 0
+        old_level = _xp_level(old_xp)
+        old_messages = int(row["messages"]) if row else 0
+        old_days = int(row["active_days"]) if row else 0
+        last_day = row["last_active_day"] if row else ""
+        new_days = old_days + (1 if last_day != today else 0)
+        new_xp = old_xp + amount
+        new_messages = old_messages + 1
+        db.execute("INSERT INTO xp_profiles(guild_id,user_id,total_xp,messages,active_days,last_active_day) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET total_xp=excluded.total_xp,messages=excluded.messages,active_days=excluded.active_days,last_active_day=excluded.last_active_day",
+                   (guild_id, user_id, new_xp, new_messages, new_days, today))
+        db.execute("INSERT INTO xp_events(guild_id,user_id,amount,created_at) VALUES(?,?,?,?)",
+                   (guild_id, user_id, amount, datetime.now(timezone.utc).isoformat()))
+        unlocked = _xp_check_achievements(db, guild_id, user_id, new_xp, new_messages, new_days)
+        new_level = _xp_level(new_xp)
+        reward_rows = db.execute("SELECT level,role_id FROM xp_level_rewards WHERE guild_id=? AND level<=?", (guild_id, new_level)).fetchall() if new_level > old_level else []
+    if new_level > old_level:
+        # Role grants are best-effort; missing permissions must not break XP tracking.
+        for reward in reward_rows:
+            role = message.guild.get_role(int(reward["role_id"]))
+            if role and role not in message.author.roles:
+                try:
+                    await message.author.add_roles(role, reason=f"VaultBot level reward: level {reward['level']}")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        if settings.get("levelup_enabled", 1):
+            channel_id = int(settings.get("levelup_channel_id", 0) or message.channel.id)
+            channel = message.guild.get_channel(channel_id)
+            if channel:
+                template = str(settings.get("announcement_text", XP_DEFAULTS["announcement_text"]))
+                try:
+                    announcement = template.format(member=message.author.mention, level=new_level, xp=new_xp)
+                    await channel.send(announcement, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+                except (discord.HTTPException, ValueError, KeyError):
+                    pass
+    for key in unlocked:
+        item = XP_ACHIEVEMENTS[key]
+        try:
+            await message.channel.send(f"{item['icon']} **Achievement unlocked: {item['name']}!**\n{message.author.mention} — {item['description']}", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        except discord.HTTPException:
+            pass
+
+
+def _xp_profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    with _xp_connect() as db:
+        row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild.id, member.id)).fetchone()
+        rank = db.execute("SELECT COUNT(*)+1 FROM xp_profiles WHERE guild_id=? AND total_xp > COALESCE((SELECT total_xp FROM xp_profiles WHERE guild_id=? AND user_id=?),-1)", (guild.id, guild.id, member.id)).fetchone()[0]
+        earned = db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=? ORDER BY unlocked_at", (guild.id, member.id)).fetchall()
+    xp = int(row["total_xp"]) if row else 0
+    messages = int(row["messages"]) if row else 0
+    days = int(row["active_days"]) if row else 0
+    level, in_level, required = _xp_level_progress(xp)
+    pct = min(100, int(in_level * 100 / required))
+    bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+    embed = discord.Embed(title=f"⬡ {member.display_name} • VaultBot Rank", color=XP_COLOR)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.description = f"**Level {level}**  ·  Server rank **#{rank}**\n`{bar}` **{pct}%** to the next level\n**{xp:,} XP** total"
+    embed.add_field(name="Messages", value=f"{messages:,}", inline=True)
+    embed.add_field(name="Active days", value=f"{days:,}", inline=True)
+    embed.add_field(name="Achievements", value=f"{len(earned)}/{len(XP_ACHIEVEMENTS)}", inline=True)
+    if earned:
+        badges = [f"{XP_ACHIEVEMENTS[r['achievement_key']]['icon']} {XP_ACHIEVEMENTS[r['achievement_key']]['name']}" for r in earned if r["achievement_key"] in XP_ACHIEVEMENTS]
+        embed.add_field(name="Unlocked badges", value=" • ".join(badges)[:1024], inline=False)
+    embed.set_footer(text="VAULTBOT SYSTEMS  •  XP & ACHIEVEMENTS")
+    return embed
+
+
+def _xp_leaderboard_embed(guild: discord.Guild, category: str, page: int, per_page: int = 10) -> discord.Embed:
+    now = datetime.now(timezone.utc)
+    if category == "weekly":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        sql = "SELECT user_id,SUM(amount) score FROM xp_events WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, start, per_page, page * per_page)
+        label = "Weekly XP"
+    elif category == "monthly":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        sql = "SELECT user_id,SUM(amount) score FROM xp_events WHERE guild_id=? AND created_at>=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, start, per_page, page * per_page)
+        label = "Monthly XP"
+    elif category == "messages":
+        sql = "SELECT user_id,messages score FROM xp_profiles WHERE guild_id=? ORDER BY score DESC,total_xp DESC LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Messages"
+    elif category == "achievements":
+        sql = "SELECT user_id,COUNT(*) score FROM xp_achievements WHERE guild_id=? GROUP BY user_id ORDER BY score DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Achievements"
+    elif category == "level":
+        sql = "SELECT user_id,total_xp score FROM xp_profiles WHERE guild_id=? ORDER BY total_xp DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Level"
+    else:
+        sql = "SELECT user_id,total_xp score FROM xp_profiles WHERE guild_id=? ORDER BY total_xp DESC,user_id LIMIT ? OFFSET ?"
+        args = (guild.id, per_page, page * per_page); label = "Total XP"
+    with _xp_connect() as db:
+        rows = db.execute(sql, args).fetchall()
+        if category == "weekly":
+            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_events WHERE guild_id=? AND created_at>=?", (guild.id, start)).fetchone()[0]
+        elif category == "monthly":
+            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_events WHERE guild_id=? AND created_at>=?", (guild.id, start)).fetchone()[0]
+        elif category == "achievements":
+            count = db.execute("SELECT COUNT(DISTINCT user_id) FROM xp_achievements WHERE guild_id=?", (guild.id,)).fetchone()[0]
+        else:
+            count = db.execute("SELECT COUNT(*) FROM xp_profiles WHERE guild_id=?", (guild.id,)).fetchone()[0]
+    lines = []
+    for i, row in enumerate(rows, start=page * per_page + 1):
+        member = guild.get_member(int(row["user_id"]))
+        if not member:
+            continue
+        score = int(row["score"] or 0)
+        if category == "level":
+            value = f"Level {_xp_level(score)} · {score:,} XP"
+        elif category == "achievements":
+            value = f"{score} achievement(s)"
+        elif category == "messages":
+            value = f"{score:,} messages"
+        else:
+            value = f"{score:,} XP"
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"`#{i}`")
+        lines.append(f"{medal} **{discord.utils.escape_markdown(member.display_name)}** — {value}")
+    embed = discord.Embed(title=f"🏆 VaultBot • {label} Leaderboard", description="\n".join(lines) if lines else "No rankings yet. Start chatting to earn XP!", color=XP_COLOR)
+    embed.set_footer(text=f"Page {page + 1} · {max(1, (count + per_page - 1) // per_page)}  •  {guild.name}")
+    return embed
+
+
+class XPLeaderboardView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int, category: str = "xp", page: int = 0):
+        super().__init__(timeout=180)
+        self.guild, self.user_id, self.category, self.page = guild, user_id, category, page
+        options = [discord.SelectOption(label="Total XP", value="xp", emoji="⚡"),
+                   discord.SelectOption(label="Highest Level", value="level", emoji="🌟"),
+                   discord.SelectOption(label="Messages", value="messages", emoji="💬"),
+                   discord.SelectOption(label="Achievements", value="achievements", emoji="🏅"),
+                   discord.SelectOption(label="Weekly XP", value="weekly", emoji="📅"),
+                   discord.SelectOption(label="Monthly XP", value="monthly", emoji="🗓️")]
+        for option in options:
+            option.default = option.value == category
+        self.category_select = discord.ui.Select(placeholder="Choose leaderboard category…", options=options, row=0)
+        self.category_select.callback = self._select_category
+        self.add_item(self.category_select)
+        prev = discord.ui.Button(label="Previous", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+        prev.callback = self._previous
+        self.add_item(prev)
+        nxt = discord.ui.Button(label="Next", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
+        nxt.callback = self._next
+        self.add_item(nxt)
+        profile = discord.ui.Button(label="My Rank", emoji="👤", style=discord.ButtonStyle.success, row=1)
+        profile.callback = self._my_rank
+        self.add_item(profile)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Run `/leaderboard` yourself to open your own controls.", ephemeral=True)
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, self.category, self.page), view=self)
+
+    async def _select_category(self, interaction: discord.Interaction):
+        self.category = self.category_select.values[0]; self.page = 0
+        for option in self.category_select.options: option.default = option.value == self.category
+        await self._refresh(interaction)
+
+    async def _previous(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1); await self._refresh(interaction)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page += 1
+        embed = _xp_leaderboard_embed(self.guild, self.category, self.page)
+        if embed.description == "No rankings yet. Start chatting to earn XP!": self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, self.category, self.page), view=self)
+
+    async def _my_rank(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=_xp_profile_embed(self.guild, interaction.user), view=None)
+
+
+class XPHubView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=180); self.guild, self.user_id = guild, user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Use `/xp` to open your own menu.", ephemeral=True); return False
+        return True
+
+    @discord.ui.button(label="My Rank", emoji="👤", style=discord.ButtonStyle.primary, row=0)
+    async def rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=_xp_profile_embed(self.guild, interaction.user), view=self)
+
+    @discord.ui.button(label="Leaderboard", emoji="🏆", style=discord.ButtonStyle.primary, row=0)
+    async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = XPLeaderboardView(self.guild, interaction.user.id)
+        await interaction.response.edit_message(embed=_xp_leaderboard_embed(self.guild, "xp", 0), view=view)
+
+    @discord.ui.button(label="Achievements", emoji="🏅", style=discord.ButtonStyle.secondary, row=0)
+    async def achievements(self, interaction: discord.Interaction, button: discord.ui.Button):
+        with _xp_connect() as db:
+            earned = {r["achievement_key"] for r in db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=?", (self.guild.id, interaction.user.id)).fetchall()}
+        lines = []
+        for key, item in XP_ACHIEVEMENTS.items():
+            status = "✅" if key in earned else "🔒"
+            lines.append(f"{status} {item['icon']} **{item['name']}** — {item['description']} *({item['rarity']})*")
+        embed = discord.Embed(title="🏅 VaultBot Achievements", description="\n".join(lines), color=XP_COLOR)
+        embed.set_footer(text=f"Unlocked {len(earned)} of {len(XP_ACHIEVEMENTS)} achievements")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Admin Settings", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
+    async def admin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("You need **Manage Server** to open XP settings.", ephemeral=True); return
+        view = XPAdminView(self.guild, interaction.user.id)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class XPSettingsModal(discord.ui.Modal, title="VaultBot XP Settings"):
+    xp_min = discord.ui.TextInput(label="Minimum XP per message", default="15", max_length=4)
+    xp_max = discord.ui.TextInput(label="Maximum XP per message", default="25", max_length=4)
+    cooldown = discord.ui.TextInput(label="Message cooldown in seconds", default="60", max_length=4)
+    async def on_submit(self, interaction: discord.Interaction):
+        settings = _xp_settings(interaction.guild_id)
+        try:
+            low, high, cooldown = int(self.xp_min.value), int(self.xp_max.value), int(self.cooldown.value)
+            if low < 0 or high < low or high > 1000 or not 1 <= cooldown <= 3600: raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Invalid values. Use XP values from 0–1000 with max ≥ min, and cooldown 1–3600 seconds.", ephemeral=True); return
+        settings.update(xp_min=low, xp_max=high, cooldown=cooldown)
+        _xp_save_settings(interaction.guild_id, settings)
+        await interaction.response.send_message(f"Saved. XP per message: **{low}–{high}**; cooldown: **{cooldown}s**.", ephemeral=True)
+
+
+class XPAdminView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=180); self.guild, self.user_id = guild, user_id
+    def build_embed(self):
+        s = _xp_settings(self.guild.id)
+        embed = discord.Embed(title="⚙️ VaultBot • XP Control Center", description="Configure the leveling system for this server.", color=XP_COLOR)
+        embed.add_field(name="System", value="Enabled" if s.get("enabled", 1) else "Disabled", inline=True)
+        embed.add_field(name="XP range", value=f"{s.get('xp_min',15)}–{s.get('xp_max',25)}", inline=True)
+        embed.add_field(name="Cooldown", value=f"{s.get('cooldown',60)}s", inline=True)
+        embed.add_field(name="Level-up announcements", value="Enabled" if s.get("levelup_enabled",1) else "Disabled", inline=True)
+        embed.add_field(name="Ignored channels", value=str(len([x for x in str(s.get('ignored_channels','')).split(',') if x.strip()])), inline=True)
+        embed.set_footer(text="Manage Server required • Settings persist across restarts")
+        return embed
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("Only the administrator who opened this panel can use it.", ephemeral=True); return False
+        return True
+    @discord.ui.button(label="Edit XP & Cooldown", emoji="⚡", style=discord.ButtonStyle.primary, row=0)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _xp_settings(self.guild.id); modal = XPSettingsModal()
+        modal.xp_min.default = str(s.get("xp_min",15)); modal.xp_max.default = str(s.get("xp_max",25)); modal.cooldown.default = str(s.get("cooldown",60))
+        await interaction.response.send_modal(modal)
+    @discord.ui.button(label="Toggle XP", emoji="🔛", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _xp_settings(self.guild.id); s["enabled"] = 0 if s.get("enabled",1) else 1; _xp_save_settings(self.guild.id,s)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    @discord.ui.button(label="Toggle Level-Up Posts", emoji="📣", style=discord.ButtonStyle.secondary, row=0)
+    async def announcements(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = _xp_settings(self.guild.id); s["levelup_enabled"] = 0 if s.get("levelup_enabled",1) else 1; _xp_save_settings(self.guild.id,s)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+    @discord.ui.button(label="Set Announcement Channel", emoji="📍", style=discord.ButtonStyle.secondary, row=1)
+    async def channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Use `/xp channel` in the server to choose the level-up announcement channel.", ephemeral=True)
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.success, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+@bot.tree.command(name="xp", description="Open VaultBot's XP, levels, and achievements hub")
+async def xp_hub(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    view = XPHubView(interaction.guild, interaction.user.id)
+    embed = discord.Embed(title="⬡ VAULTBOT • LEVELING HUB", description="Earn XP by chatting, level up, unlock achievements, and climb the leaderboard.\n\nChoose an option below to get started.", color=XP_COLOR)
+    embed.set_footer(text="VAULTBOT SYSTEMS  •  XP / LEVELS / ACHIEVEMENTS")
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+
+
+@bot.tree.command(name="rank", description="View your rank or another member's VaultBot XP profile")
+@app_commands.describe(member="Member whose profile you want to view")
+async def xp_rank(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    await interaction.response.send_message(embed=_xp_profile_embed(interaction.guild, member or interaction.user), ephemeral=False)
+
+
+@bot.tree.command(name="leaderboard", description="Browse VaultBot XP and achievement leaderboards")
+async def xp_leaderboard(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    view = XPLeaderboardView(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=_xp_leaderboard_embed(interaction.guild, "xp", 0), view=view)
+
+
+@bot.tree.command(name="achievements", description="Browse VaultBot achievements for yourself or a member")
+@app_commands.describe(member="Member whose achievements you want to view")
+async def xp_achievements(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
+    target = member or interaction.user
+    with _xp_connect() as db:
+        earned = {r["achievement_key"] for r in db.execute("SELECT achievement_key FROM xp_achievements WHERE guild_id=? AND user_id=?", (interaction.guild.id, target.id)).fetchall()}
+    lines = [f"{'✅' if key in earned else '🔒'} {item['icon']} **{item['name']}** — {item['description']} *({item['rarity']})*" for key, item in XP_ACHIEVEMENTS.items()]
+    embed = discord.Embed(title=f"🏅 {target.display_name}'s Achievements", description="\n".join(lines), color=XP_COLOR)
+    embed.set_footer(text=f"Unlocked {len(earned)} of {len(XP_ACHIEVEMENTS)}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="xpadmin", description="Open VaultBot's XP administration panel")
+@app_commands.default_permissions(manage_guild=True)
+async def xp_admin(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** permission to configure XP.", ephemeral=True); return
+    view = XPAdminView(interaction.guild, interaction.user.id)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+
+@bot.tree.command(name="xpchannel", description="Set the channel for VaultBot level-up announcements")
+@app_commands.describe(channel="Channel where level-up announcements should be posted")
+@app_commands.default_permissions(manage_guild=True)
+async def xp_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** permission.", ephemeral=True); return
+    settings = _xp_settings(interaction.guild.id); settings["levelup_channel_id"] = channel.id; _xp_save_settings(interaction.guild.id, settings)
+    await interaction.response.send_message(f"Level-up announcements will be sent to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="xpreward", description="Set or update a level-based role reward")
+@app_commands.describe(level="Level required to earn this role", role="Role granted at this level")
+@app_commands.default_permissions(manage_guild=True)
+async def xp_reward(interaction: discord.Interaction, level: app_commands.Range[int, 1, 1000], role: discord.Role):
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need **Manage Server** permission.", ephemeral=True); return
+    if role.is_default() or role >= interaction.guild.me.top_role:
+        await interaction.response.send_message("I can't grant that role. Move my role above the reward role and choose a normal server role.", ephemeral=True); return
+    with _xp_connect() as db:
+        db.execute("INSERT INTO xp_level_rewards(guild_id,level,role_id) VALUES(?,?,?) ON CONFLICT(guild_id,level) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, level, role.id))
+    await interaction.response.send_message(f"Saved reward: members reaching level **{level}** will receive {role.mention}.", ephemeral=True)
+
+
+# Initialize storage before the bot starts. Errors fail loudly instead of silently losing XP.
+_xp_init_db()
+print(f"[XP] SQLite storage ready: {XP_DB_PATH}")
 
 
 # =============================================================================
