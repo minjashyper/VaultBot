@@ -109,6 +109,9 @@ intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 intents.messages = True
+# Required to track member join/leave events for profile history. Enable the
+# Server Members Intent in the Discord Developer Portal as well.
+intents.members = True
 
 # help_command=None disables discord.py's built-in help so the custom
 # multi-page help in section 9 can take over the ~help command.
@@ -1178,6 +1181,7 @@ HELP_PAGES: list[dict] = [
         "color": BRAND_COLOR,
         "description": "Some VaultBot features run automatically and don't need a command.",
         "fields": [
+            ("`~profile [@member]`", "Shows a member profile embed with their avatar, account creation date, server join date, server tenure, roles, VaultBot XP/message stats when available, and joins/departures recorded since this feature was installed."),
             ("Random chat replies", "When enabled, VaultBot may occasionally reply to messages containing greetings (`hello`, `hi`, `hey`, `yo`), morning/night greetings, laughter, or game-related words. It can also react to image uploads with a short reply. Replies are randomized, only considered in servers, and are limited by a per-channel cooldown."),
             ("Current auto-reply settings", "Auto-replies are enabled in this build with a 40% chance after a matching message and a 60-second per-channel cooldown. These values and the reply text can be changed in the script (`AUTO_REPLY_ENABLED`, `AUTO_REPLY_CHANCE`, `AUTO_REPLY_COOLDOWN`, `AUTO_REPLY_KEYWORDS`, and `AUTO_REPLY_IMAGES`)."),
             ("Other background features", "The Juice WRLD tracker can post unseen tracker changes when `JUICEWRLD_CHANNEL_ID` is configured. Patch Notes, FreeStuff, and Twitch Drops each have their own host settings and setup requirements on their dedicated pages. Features that depend on external feeds or API keys remain unavailable until configured and reachable."),
@@ -1393,6 +1397,44 @@ def _pick_auto_reply(message: discord.Message) -> Optional[str]:
 
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    """Record joins from the point this feature is installed."""
+    if member.bot:
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        with _xp_connect() as db:
+            db.execute(
+                """INSERT INTO profile_presence (guild_id, user_id, joins, leaves, first_recorded_join, last_joined)
+                   VALUES (?, ?, 1, 0, ?, ?)
+                   ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                     joins = profile_presence.joins + 1,
+                     first_recorded_join = COALESCE(profile_presence.first_recorded_join, excluded.first_recorded_join),
+                     last_joined = excluded.last_joined""",
+                (member.guild.id, member.id, now, now),
+            )
+    except Exception as error:
+        print(f"[Profile] Could not record member join: {type(error).__name__}: {error}")
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """Record departures from the point this feature is installed."""
+    if member.bot:
+        return
+    try:
+        with _xp_connect() as db:
+            db.execute(
+                """INSERT INTO profile_presence (guild_id, user_id, joins, leaves, first_recorded_join, last_joined)
+                   VALUES (?, ?, 0, 1, NULL, NULL)
+                   ON CONFLICT(guild_id, user_id) DO UPDATE SET leaves = profile_presence.leaves + 1""",
+                (member.guild.id, member.id),
+            )
+    except Exception as error:
+        print(f"[Profile] Could not record member departure: {type(error).__name__}: {error}")
+
+
+@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
@@ -1444,6 +1486,89 @@ async def help_command(ctx: commands.Context, *, topic: str = ""):
 async def musichelp_command(ctx: commands.Context):
     """Open the command list on the music page."""
     await send_help(ctx, "music")
+
+
+# ---- Member profiles ----
+
+@bot.command(name="profile", aliases=["userinfo", "memberinfo"])
+@commands.guild_only()
+async def profile_command(ctx: commands.Context, member: Optional[discord.Member] = None):
+    """Show a member's avatar, account/server dates, roles, and tracked history."""
+    target = member or ctx.author
+    created = target.created_at
+    joined = target.joined_at
+    now = datetime.now(timezone.utc)
+
+    embed = discord.Embed(
+        title=f"👤 {target.display_name} • Member Profile",
+        description=f"{target.mention}\n`{target}` · ID: `{target.id}`",
+        color=XP_COLOR if "XP_COLOR" in globals() else BRAND_COLOR,
+        timestamp=now,
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(
+        name="📅 Account Created",
+        value=f"{discord.utils.format_dt(created, style='D')}\n{discord.utils.format_dt(created, style='R')}",
+        inline=True,
+    )
+    if joined:
+        embed.add_field(
+            name="📥 Joined This Server",
+            value=f"{discord.utils.format_dt(joined, style='D')}\n{discord.utils.format_dt(joined, style='R')}",
+            inline=True,
+        )
+        duration = now - joined
+        days = max(0, duration.days)
+        years, rem = divmod(days, 365)
+        months, rem_days = divmod(rem, 30)
+        parts = []
+        if years:
+            parts.append(f"{years}y")
+        if months:
+            parts.append(f"{months}mo")
+        parts.append(f"{rem_days}d")
+        tenure = " ".join(parts)
+    else:
+        tenure = "Unknown"
+        embed.add_field(name="📥 Joined This Server", value="Unknown", inline=True)
+    embed.add_field(name="⏳ Server Tenure", value=tenure, inline=True)
+
+    try:
+        with _xp_connect() as db:
+            row = db.execute(
+                "SELECT joins, leaves FROM profile_presence WHERE guild_id=? AND user_id=?",
+                (ctx.guild.id, target.id),
+            ).fetchone()
+            xp_row = db.execute(
+                "SELECT total_xp, messages FROM xp_profiles WHERE guild_id=? AND user_id=?",
+                (ctx.guild.id, target.id),
+            ).fetchone()
+    except Exception as error:
+        print(f"[Profile] Could not load profile: {type(error).__name__}: {error}")
+        row = None
+        xp_row = None
+
+    joins = int(row["joins"]) if row else 0
+    leaves = int(row["leaves"]) if row else 0
+    embed.add_field(name="🔄 Recorded Joins", value=str(joins), inline=True)
+    embed.add_field(name="🚪 Recorded Departures", value=str(leaves), inline=True)
+    if xp_row:
+        total_xp = int(xp_row["total_xp"])
+        messages = int(xp_row["messages"])
+        level = _xp_level(total_xp) if "_xp_level" in globals() else "—"
+        embed.add_field(name="✨ VaultBot XP", value=f"Level **{level}** · **{total_xp:,} XP**", inline=True)
+        embed.add_field(name="💬 Tracked Messages", value=f"{messages:,}", inline=True)
+
+    roles = [role.mention for role in reversed(target.roles) if not role.is_default()]
+    if roles:
+        role_text = " · ".join(roles[:10])
+        if len(roles) > 10:
+            role_text += f" · +{len(roles) - 10} more"
+    else:
+        role_text = "No roles"
+    embed.add_field(name=f"🏷️ Roles ({len(roles)})", value=role_text[:1024], inline=False)
+    embed.set_footer(text="VAULTBOT • Member history tracked from feature installation")
+    await ctx.send(embed=embed)
 
 
 # ---- Music ----
@@ -5108,6 +5233,11 @@ def _xp_init_db():
         CREATE TABLE IF NOT EXISTS xp_level_rewards (
             guild_id INTEGER NOT NULL, level INTEGER NOT NULL, role_id INTEGER NOT NULL,
             PRIMARY KEY (guild_id, level));
+        CREATE TABLE IF NOT EXISTS profile_presence (
+            guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            joins INTEGER NOT NULL DEFAULT 0, leaves INTEGER NOT NULL DEFAULT 0,
+            first_recorded_join TEXT, last_joined TEXT,
+            PRIMARY KEY (guild_id, user_id));
         """)
 
 
