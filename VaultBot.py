@@ -1248,9 +1248,17 @@ async def on_ready():
     print(f"Bot is online as {bot.user}")
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        print(f"Synced {len(synced)} global slash command(s): " + ", ".join(cmd.name for cmd in synced))
+        # Optional guild sync makes newly-added commands (such as /xp) appear
+        # immediately in the configured server instead of waiting for global propagation.
+        guild_id_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
+        if guild_id_raw.isdigit():
+            target_guild = discord.Object(id=int(guild_id_raw))
+            bot.tree.copy_global_to(guild=target_guild)
+            guild_synced = await bot.tree.sync(guild=target_guild)
+            print(f"Synced {len(guild_synced)} guild slash command(s) for {guild_id_raw}: " + ", ".join(cmd.name for cmd in guild_synced))
     except Exception as error:
-        print(f"Command sync failed: {error}")
+        print(f"Command sync failed: {type(error).__name__}: {error}")
 
     _load_juicewrld_state()
     if JUICEWRLD_CHANNEL_ID:
@@ -4592,17 +4600,21 @@ async def _drops_fetch() -> list:
     """Fetch a complete bounded RSS/Atom document; retry transient malformed responses once."""
     timeout = aiohttp.ClientTimeout(total=25)
     headers = {
-        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml",
-        "User-Agent": "VaultBot/1.0 (Discord Twitch Drops alerts)",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+        "User-Agent": "Mozilla/5.0 (compatible; VaultBot/1.1; Twitch Drops feed reader)",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     last_parse_error = None
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         for attempt in range(2):
+            # Read the complete HTTP response before parsing. StreamReader.read(n)
+            # may return a partial chunk before EOF; parsing that chunk can produce
+            # "no element found" even when the server eventually sends valid XML.
+            # The response is bounded after download to avoid accepting huge feeds.
             async with session.get(DROPS_FEED_URL) as resp:
                 resp.raise_for_status()
-                # Read one byte beyond the cap so oversized feeds are detected rather
-                # than silently truncated into invalid XML.
-                data = await resp.content.read(DROPS_MAX_FEED_BYTES + 1)
+                data = await resp.read()
             if len(data) > DROPS_MAX_FEED_BYTES:
                 raise ValueError(
                     f"Drops feed exceeds {DROPS_MAX_FEED_BYTES} bytes; refusing truncated XML"
@@ -5367,7 +5379,7 @@ class XPAdminView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
     @discord.ui.button(label="Set Announcement Channel", emoji="📍", style=discord.ButtonStyle.secondary, row=1)
     async def channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Use `/xp channel` in the server to choose the level-up announcement channel.", ephemeral=True)
+        await interaction.response.send_message("Use `/xpchannel` in the server to choose the level-up announcement channel.", ephemeral=True)
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.success, row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
