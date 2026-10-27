@@ -6519,49 +6519,81 @@ async def _wwe_fetch_schedule():
 async def _wwe_fetch_streamed_smackdown_events():
     """Use Streamed's event metadata to find scheduled/live SmackDown listings.
 
-    This uses match titles and timestamps only; it does not resolve or redistribute
-    stream URLs. The API's listings are third-party data and may be incomplete.
+    Tries the current streamed.st API domain first, then the legacy streamed.pk
+    domain. Only event titles and timestamps are used; stream URLs are not read.
     """
-    base = "https://streamed.pk/api/matches"
+    bases = (
+        "https://streamed.st/api/matches",
+        "https://streamed.pk/api/matches",
+    )
     timeout = aiohttp.ClientTimeout(total=10)
-    headers = {"User-Agent": "VaultBot WWE Alerts/1.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; VaultBot WWE Alerts/1.0)",
+        "Accept": "application/json",
+    }
     collected = {}
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        for endpoint in (f"{base}/all-today", f"{base}/live"):
-            try:
-                async with session.get(endpoint, headers=headers) as resp:
-                    resp.raise_for_status()
-                    payload = await resp.json(content_type=None)
-                if not isinstance(payload, list):
+        for endpoint_name in ("all-today", "live"):
+            last_error = None
+            payload = None
+            for base in bases:
+                url = f"{base}/{endpoint_name}"
+                try:
+                    async with session.get(url, allow_redirects=True) as resp:
+                        body = await resp.text(errors="replace")
+                        if resp.status >= 400:
+                            raise aiohttp.ClientResponseError(
+                                resp.request_info, resp.history,
+                                status=resp.status,
+                                message=f"HTTP {resp.status} from {url}",
+                                headers=resp.headers,
+                            )
+                        try:
+                            payload = json.loads(body)
+                        except json.JSONDecodeError as exc:
+                            preview = re.sub(r"\s+", " ", body[:140]).strip()
+                            raise ValueError(
+                                f"non-JSON response from {url} "
+                                f"(content-type={resp.headers.get('Content-Type', 'unknown')!r}; "
+                                f"body={preview!r})"
+                            ) from exc
+                        if not isinstance(payload, list):
+                            raise ValueError(f"unexpected JSON shape from {url}: {type(payload).__name__}")
+                        break
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    last_error = exc
+                    payload = None
+            if payload is None:
+                if last_error:
+                    print(f"[WWE] Streamed {endpoint_name} feed unavailable on both domains: {type(last_error).__name__}: {str(last_error)[:240]}")
+                continue
+
+            for item in payload:
+                if not isinstance(item, dict):
                     continue
-                for item in payload:
-                    if not isinstance(item, dict):
-                        continue
-                    title = str(item.get("title") or "").strip()
-                    # Avoid matching unrelated wrestling events or WWE RAW/PLEs.
-                    if not re.search(r"\bsmack\s*down\b", title, re.I):
-                        continue
-                    raw_date = item.get("date")
-                    try:
-                        stamp = float(raw_date)
-                        # Docs specify Unix milliseconds; tolerate seconds if returned.
-                        if stamp < 10_000_000_000:
-                            stamp *= 1000
-                        start_utc = datetime.fromtimestamp(stamp / 1000, tz=timezone.utc)
-                    except (TypeError, ValueError, OSError, OverflowError):
-                        continue
-                    if start_utc < datetime.now(timezone.utc) - timedelta(minutes=10):
-                        continue
-                    key = f"WWE SmackDown|{start_utc.isoformat()}"
-                    collected[key] = {
-                        "key": key,
-                        "name": "WWE SmackDown",
-                        "start": start_utc.isoformat(),
-                        "url": "https://www.netflix.com/",
-                        "source": "Streamed API event metadata",
-                    }
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                print(f"[WWE] Streamed API check failed for {endpoint.rsplit('/', 1)[-1]}: {type(exc).__name__}")
+                title = str(item.get("title") or "").strip()
+                # Avoid matching unrelated wrestling events or WWE RAW/PLEs.
+                if not re.search(r"\bsmack\s*down\b", title, re.I):
+                    continue
+                raw_date = item.get("date")
+                try:
+                    stamp = float(raw_date)
+                    # API docs specify Unix milliseconds; tolerate seconds too.
+                    if stamp < 10_000_000_000:
+                        stamp *= 1000
+                    start_utc = datetime.fromtimestamp(stamp / 1000, tz=timezone.utc)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    continue
+                if start_utc < datetime.now(timezone.utc) - timedelta(minutes=10):
+                    continue
+                key = f"WWE SmackDown|{start_utc.isoformat()}"
+                collected[key] = {
+                    "key": key,
+                    "name": "WWE SmackDown",
+                    "start": start_utc.isoformat(),
+                    "url": "https://www.netflix.com/",
+                    "source": "Streamed API event metadata",
+                }
     return list(collected.values())
 
 async def _wwe_post_alert(channel, event, phase):
