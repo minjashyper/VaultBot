@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, urljoin
 
 import aiohttp
 import discord
@@ -53,6 +53,7 @@ import yt_dlp
 
 
 import html
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import timezone
@@ -1015,6 +1016,12 @@ HELP_PAGES: list[dict] = [
                 "lets you choose alternate or related matches from a dropdown, and "
                 "shows detailed metadata and lets you search the API file browser for matching audio files.\n"
                 f"Example: `{PREFIX}jwsong lucid dreams`",
+            ),
+            (
+                "`~jwgb [song name]`",
+                "Shows the newest group-buy entry from juicewrld.io when used by itself, "
+                "or searches the entries currently loaded by the archive page when a name is supplied. "
+                "The command shows historical metadata only, not seller or payment links.",
             ),
             (
                 "📡 Automatic Tracker Feed",
@@ -2533,6 +2540,199 @@ class JuiceWRLDSongView(discord.ui.View):
                 await self.message.edit(view=self)
             except (discord.HTTPException, discord.NotFound):
                 pass
+
+
+# juicewrld.io group-buy archive. It is an informational archive; it does not
+# expose or link sellers/payment methods.
+JUICEWRLD_GROUP_BUYS_URL = "https://juicewrld.io/groupbuys"
+
+
+class _JuiceWRLDGroupBuyHTMLParser(HTMLParser):
+    """Extract group-buy table rows from juicewrld.io without third-party parsers."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self.links = []
+        self._row = None
+        self._anchor = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "tr":
+            if self._row is not None:
+                self._finish_row()
+            self._row = {"parts": [], "links": []}
+        if tag.lower() == "a":
+            link = {"href": attrs.get("href", ""), "parts": []}
+            self.links.append(link)
+            if self._row is not None:
+                self._row["links"].append(link)
+            self._anchor = link
+
+    def handle_data(self, data):
+        if self._row is not None:
+            self._row["parts"].append(data)
+        if self._anchor is not None:
+            self._anchor["parts"].append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "a":
+            self._anchor = None
+        elif tag == "tr":
+            self._finish_row()
+
+    def _finish_row(self):
+        if self._row is not None:
+            text = " ".join(" ".join(self._row["parts"]).split())
+            if text:
+                self.rows.append({"text": text, "links": self._row["links"]})
+        self._row = None
+
+
+def _juicewrld_group_buy_from_row(row):
+    """Normalize one table row into the fields used by the Discord embed."""
+    row_text = row.get("text", "")
+    title = None
+    song_url = None
+    for link in row.get("links", []):
+        href = (link.get("href") or "").strip()
+        link_text = " ".join(" ".join(link.get("parts", [])).split())
+        if not href or not link_text or link_text.lower() == "image":
+            continue
+        absolute = urljoin(JUICEWRLD_GROUP_BUYS_URL, href)
+        path = urlparse(absolute).path.lower()
+        if "/song/" in path or "/session/" in path or "/version/" in path:
+            title = link_text
+            song_url = absolute
+            break
+    if not title:
+        return None
+
+    amounts = re.findall(r"\$\s?[\d,]+(?:\.\d{1,2})?", row_text)
+    goal = amounts[-1].replace(" ", "") if amounts else "Not listed"
+
+    outcome_match = re.search(r"\b(Not\s+finished|Finished|Unknown)\b", row_text, re.IGNORECASE)
+    outcome = "Not recorded"
+    if outcome_match:
+        outcome = re.sub(r"\s+", " ", outcome_match.group(1)).title()
+
+    date_match = re.search(
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b",
+        row_text,
+        re.IGNORECASE,
+    )
+    date_text = date_match.group(0).replace(",", "") if date_match else "Date not listed"
+
+    return {
+        "title": title[:250],
+        "url": song_url,
+        "text": row_text[:1200],
+        "goal": goal,
+        "outcome": outcome,
+        "date": date_text,
+    }
+
+
+async def _fetch_juicewrld_group_buys():
+    timeout = aiohttp.ClientTimeout(total=18)
+    headers = {
+        "User-Agent": "VaultBot/1.0 (Discord archive lookup)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(JUICEWRLD_GROUP_BUYS_URL, allow_redirects=True) as response:
+            response.raise_for_status()
+            source = await response.text()
+
+    parser = _JuiceWRLDGroupBuyHTMLParser()
+    parser.feed(source)
+    parser.close()
+    items = []
+    for row in parser.rows:
+        item = _juicewrld_group_buy_from_row(row)
+        if item:
+            items.append(item)
+
+    # Defensive fallback if the website changes away from table rows: still
+    # produce a useful latest-entry link from the first song links we can parse.
+    if not items:
+        seen = set()
+        for link in parser.links:
+            href = (link.get("href") or "").strip()
+            title = " ".join(" ".join(link.get("parts", [])).split())
+            if not href or not title or title.lower() == "image":
+                continue
+            absolute = urljoin(JUICEWRLD_GROUP_BUYS_URL, href)
+            path = urlparse(absolute).path.lower()
+            if not any(route in path for route in ("/song/", "/session/", "/version/")):
+                continue
+            if absolute in seen:
+                continue
+            seen.add(absolute)
+            items.append({
+                "title": title[:250], "url": absolute, "text": title,
+                "goal": "See archive", "outcome": "See archive", "date": "See archive",
+            })
+            if len(items) >= 30:
+                break
+    return items
+
+
+@bot.command(name="jwgb")
+async def juicewrld_group_buy(ctx: commands.Context, *, query: Optional[str] = None):
+    """Show the newest Juice WRLD group buy, or search loaded archive entries."""
+    try:
+        items = await _fetch_juicewrld_group_buys()
+        if not items:
+            await ctx.send(
+                "I couldn't read the group-buy entries from juicewrld.io right now. "
+                f"You can open the archive directly: {JUICEWRLD_GROUP_BUYS_URL}"
+            )
+            return
+
+        if query and query.strip():
+            needle = query.strip().casefold()
+            matches = [item for item in items if needle in item["title"].casefold() or needle in item["text"].casefold()]
+            if not matches:
+                await ctx.send(
+                    f"No matching group-buy entry was found in the entries currently available to VaultBot for **{discord.utils.escape_markdown(query[:100])}**.\n"
+                    f"Search the complete archive here: {JUICEWRLD_GROUP_BUYS_URL}"
+                )
+                return
+            item = matches[0]
+            heading = f"🧃 Juice WRLD Group Buy: {item['title']}"
+        else:
+            item = items[0]
+            heading = f"🧃 Latest Juice WRLD Group Buy: {item['title']}"
+
+        embed = discord.Embed(
+            title=heading[:256],
+            url=item.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+            description=(
+                f"**Entry:** [{discord.utils.escape_markdown(item['title'])}]({item.get('url') or JUICEWRLD_GROUP_BUYS_URL})\n"
+                "Archive details from juicewrld.io; this command does not provide seller or payment links."
+            ),
+            color=JUICE_COLOR,
+        )
+        embed.add_field(name="Goal", value=item.get("goal") or "Not listed", inline=True)
+        embed.add_field(name="Outcome", value=item.get("outcome") or "Not recorded", inline=True)
+        embed.add_field(name="Date", value=item.get("date") or "Not listed", inline=True)
+        embed.set_footer(text="Source: juicewrld.io/groupbuys • Archive information only")
+        await ctx.send(embed=embed)
+
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError) as exc:
+        print(f"[JuiceWRLD] Group-buy lookup failed: {exc!r}")
+        await ctx.send(
+            "The juicewrld.io group-buy archive couldn't be reached right now. "
+            f"Try again later: {JUICEWRLD_GROUP_BUYS_URL}"
+        )
+    except Exception as exc:
+        print(f"[JuiceWRLD] Unexpected group-buy lookup error: {type(exc).__name__}: {exc!r}")
+        await ctx.send("I couldn't load the group-buy entry. Please try again later.")
 
 
 @bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
