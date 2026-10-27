@@ -551,7 +551,14 @@ async def play_next(ctx: commands.Context) -> None:
                 return
             jw_radio_starting.add(guild_id)
             try:
-                track = await _fetch_random_jw_track("Juice WRLD Radio")
+                avoid_title = (
+                    previous.title
+                    if previous and previous.requester == "Juice WRLD Radio"
+                    else ""
+                )
+                track = await _fetch_random_jw_track(
+                    "Juice WRLD Radio", avoid_title=avoid_title
+                )
             except Exception as exc:
                 jw_radio_active.discard(guild_id)
                 current_tracks.pop(guild_id, None)
@@ -2352,6 +2359,100 @@ def _jw_file_is_directory(item):
     return str(item.get("type", "")).casefold() in {"directory", "dir", "folder"}
 
 
+def _jw_is_beat_or_instrumental(path, item=None) -> bool:
+    """Return True for obvious beat/instrumental uploads, not full songs."""
+    item = item if isinstance(item, dict) else {}
+    if any(item.get(key) is True for key in ("is_instrumental", "instrumental", "is_beat", "beat_only")):
+        return True
+
+    metadata = " ".join(
+        str(item.get(key, ""))
+        for key in ("type", "category", "kind", "title", "name", "description", "tags")
+    ).casefold()
+    normalized_path = str(path or "").replace("\\", "/").casefold()
+    full_text = f"{normalized_path} {metadata}"
+
+    # Directory names are strong signals; this also catches the API's
+    # Instrumentals/<album>/<track>/... structure shown in its file listing.
+    parts = [part.strip() for part in normalized_path.split("/") if part.strip()]
+    blocked_folders = {
+        "instrumental", "instrumentals", "beats", "beat", "type beats",
+        "type-beats", "typebeats", "beat instrumentals", "instrumental beats",
+    }
+    if any(part in blocked_folders for part in parts[:-1]):
+        return True
+
+    # Catch common beat filenames such as "NM - Komodo 140BPM.wav" while
+    # avoiding a blanket substring match on ordinary song titles.
+    beat_patterns = (
+        r"\binstrumentals?\b", r"\btype[ _-]?beats?\b",
+        r"\bbeat[ _-]?only\b", r"\bprod(?:uced)?[ _-]?by\b",
+        r"\b\d{2,3}\s*bpm\b", r"\b(?:drumless|loop kit|beat pack)\b",
+    )
+    if any(re.search(pattern, full_text) for pattern in beat_patterns):
+        return True
+
+    # A standalone "beat" or "beats" in a filename/title is a useful clue,
+    # but don't block unrelated titles just because they contain the letters.
+    stem = Path(parts[-1]).stem if parts else str(path or "")
+    if re.search(r"(?:^|[ _-])(?:beat|beats)(?:$|[ _-])", stem.casefold()):
+        return True
+    return False
+
+
+def _jw_is_fanmade_or_altered(path, item=None) -> bool:
+    """Filter obvious unofficial remixes, covers, mashups, and edited uploads.
+
+    The API does not reliably expose rights/official-status metadata, so this is
+    deliberately a conservative filename, folder, and metadata heuristic.
+    """
+    item = item if isinstance(item, dict) else {}
+    for key in ("is_remix", "is_cover", "is_mashup", "is_fanmade", "fan_made",
+                "is_unofficial", "is_ai_cover", "is_edit", "is_sped_up", "is_slowed"):
+        if item.get(key) is True:
+            return True
+
+    normalized_path = str(path or "").replace("\\", "/").casefold()
+    metadata = " ".join(
+        str(item.get(key, ""))
+        for key in ("type", "category", "kind", "title", "name", "description", "tags", "artist", "album")
+    ).casefold()
+    full_text = f"{normalized_path} {metadata}"
+
+    # A folder explicitly dedicated to alternate/community edits is a strong signal.
+    blocked_folders = {
+        "remix", "remixes", "fan remixes", "fanmade remixes", "fan-made remixes",
+        "mashup", "mashups", "covers", "cover versions", "edits", "fan edits",
+        "unofficial", "bootlegs", "bootleg", "ai covers", "ai generated",
+        "sped up", "slowed", "slowed reverb", "nightcore", "8d audio",
+    }
+    parts = [part.strip() for part in normalized_path.split("/") if part.strip()]
+    if any(part in blocked_folders for part in parts[:-1]):
+        return True
+
+    # Word-boundary patterns avoid matching incidental substrings in normal titles.
+    altered_patterns = (
+        r"\bremix(?:ed)?\b", r"\b(?:fan[ -]?made|fanmade|unofficial)\b",
+        r"\bmash[ -]?up\b", r"\bbootleg\b", r"\bcover(?: version)?\b",
+        r"\b(?:sped[ -]?up|speed[ -]?up|slowed(?:[ -]?down)?|slowed[ -]?reverb)\b",
+        r"\bnightcore\b", r"\b8d(?:[ -]?audio)?\b",
+        r"\bchopped[ -]?and[ -]?screwed\b", r"\b(?:reverb edit|fan edit|edit audio)\b",
+        r"\b(?:ai cover|ai voice|ai generated|artificial intelligence cover)\b",
+        r"\b(?:reimagined|flip|flip version|remake)\b",
+    )
+    return any(re.search(pattern, full_text) for pattern in altered_patterns)
+
+
+def _jw_radio_title_key(title: str) -> str:
+    """Normalize a file title so alternate versions of the same song compare equal."""
+    title = Path(str(title or "")).stem
+    # Ignore common version notes and featured-artist notes, which often differ
+    # between uploads even when the underlying song title is the same.
+    title = re.sub(r"\s*[\[(][^\])]*(?:version|ver\.?|demo|remaster|remastered|mix|edit|v\d+|feat\.?|ft\.?)[^\])]*[\])]\s*", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[-–—_]\s*(?:v\d+|version\s*\d+|demo|remaster(?:ed)?|alternate mix)\s*$", " ", title, flags=re.IGNORECASE)
+    return "".join(char.casefold() for char in title if char.isalnum())
+
+
 def _jw_audio_candidates(items, query, limit=25):
     """Filter API file-list entries to likely matching audio files."""
     suffixes = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
@@ -2363,6 +2464,8 @@ def _jw_audio_candidates(items, query, limit=25):
             continue
         path = _jw_file_path(item)
         if not path or Path(path).suffix.casefold() not in suffixes:
+            continue
+        if _jw_is_beat_or_instrumental(path, item) or _jw_is_fanmade_or_altered(path, item):
             continue
         normalized = "".join(ch.casefold() for ch in Path(path).stem if ch.isalnum())
         if q and q not in normalized and normalized not in q:
@@ -3516,8 +3619,8 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
     raise ValueError("The Juice WRLD API could not provide playable audio.")
 
 
-async def _fetch_random_jw_track(requester: str) -> Track:
-    """Try several random API-listed files so one broken download won't kill radio."""
+async def _fetch_random_jw_track(requester: str, avoid_title: str = "") -> Track:
+    """Pick a random song, avoiding the previous radio title when possible."""
     payload = await _juicewrld_api_get("/files/list-all/")
     entries = _juicewrld_items(payload)
     audio_files = _jw_audio_candidates(entries, query="", limit=10000)
@@ -3527,6 +3630,19 @@ async def _fetch_random_jw_track(requester: str) -> Track:
         audio_files = _jw_audio_candidates(entries, query="", limit=10000)
     if not audio_files:
         raise ValueError("The Juice WRLD API did not list any playable audio files.")
+
+    previous_key = _jw_radio_title_key(avoid_title) if avoid_title else ""
+    if previous_key:
+        different_titles = [
+            (path, info) for path, info in audio_files
+            if _jw_radio_title_key(Path(path).stem) != previous_key
+        ]
+        if not different_titles:
+            raise ValueError(
+                f"The API listing only offered another version of '{avoid_title}', "
+                "so I skipped it to avoid playing the same song back-to-back."
+            )
+        audio_files = different_titles
 
     random.shuffle(audio_files)
     errors = []
@@ -3688,7 +3804,9 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
                         item.update(detail)
                 except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
                     print(f"[JuiceWRLD] Audio detail lookup failed: {exc}")
-            if isinstance(item.get("path"), str) and item["path"].strip():
+            if (isinstance(item.get("path"), str) and item["path"].strip()
+                    and not _jw_is_beat_or_instrumental(item["path"], item)
+                    and not _jw_is_fanmade_or_altered(item["path"], item)):
                 selected = item
                 break
 
