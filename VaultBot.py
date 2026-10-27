@@ -101,6 +101,12 @@ JUICEWRLD_STATE_FILE = Path(os.getenv(
     "JUICEWRLD_STATE_FILE",
     str(Path(tempfile.gettempdir()) / "juicewrld_seen.json")
 ))
+# A small persistent catalog cache lets radio start without re-downloading the
+# full file listing after every bot restart. /data is persistent on the current host.
+JUICEWRLD_CATALOG_CACHE_FILE = Path(os.getenv(
+    "JUICEWRLD_CATALOG_CACHE_FILE",
+    "/data/juicewrld_audio_catalog.json",
+))
 
 
 # =============================================================================
@@ -778,15 +784,27 @@ def _save_juicewrld_state() -> None:
     temporary_path.replace(JUICEWRLD_STATE_FILE)
 
 
-async def _juicewrld_api_get(path: str, params: Optional[dict] = None):
-    """Call the Juice WRLD API with a longer timeout and transient-error retries."""
-    timeout = aiohttp.ClientTimeout(total=60, sock_connect=20, sock_read=40)
+async def _juicewrld_api_get(
+    path: str,
+    params: Optional[dict] = None,
+    *,
+    timeout_seconds: int = 60,
+    retries: int = 3,
+):
+    """Call the Juice WRLD API with configurable timeouts and transient-error retries."""
+    timeout_seconds = max(3, int(timeout_seconds))
+    retries = max(1, int(retries))
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_seconds,
+        sock_connect=min(20, timeout_seconds),
+        sock_read=min(40, timeout_seconds),
+    )
     headers = {"Accept": "application/json"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
 
     last_error = None
-    for attempt in range(3):
+    for attempt in range(retries):
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(
@@ -802,8 +820,8 @@ async def _juicewrld_api_get(path: str, params: Optional[dict] = None):
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last_error = exc
 
-        if attempt < 2:
-            await asyncio.sleep(1.5 * (attempt + 1))
+        if attempt < retries - 1:
+            await asyncio.sleep(0.75 * (attempt + 1))
 
     if last_error:
         raise last_error
@@ -3661,8 +3679,10 @@ def _jw_parse_duration(song: dict) -> Optional[int]:
     return None
 
 
-async def _download_juicewrld_track(song: dict, requester: str) -> Track:
-    """Download an API-linked audio file with compressed-first retries."""
+async def _download_juicewrld_track(
+    song: dict, requester: str, *, radio_fast: bool = False
+) -> Track:
+    """Download an API audio file; radio mode favors quick skips over long stalls."""
     raw_path = song.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ValueError("This catalog result does not have a downloadable audio path.")
@@ -3679,8 +3699,11 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
     # be slow to serve), then fall back to the original file endpoint.
     attempts = [
         ("files/download-compressed/", {"path": remote_path, "bitrate": "160k"}, ".mp3"),
-        ("files/download/", {"path": remote_path}, original_suffix),
     ]
+    # Manual song requests keep their robust original-file fallback. Radio uses
+    # compressed MP3 only so one dead catalog entry cannot stall the whole queue.
+    if not radio_fast:
+        attempts.append(("files/download/", {"path": remote_path}, original_suffix))
     headers = {"Accept": "audio/*, application/octet-stream"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
@@ -3688,13 +3711,18 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
     max_bytes = 200 * 1024 * 1024
     last_error = None
     for endpoint, params, suffix in attempts:
-        for attempt in range(3):
+        endpoint_attempts = 1 if radio_fast else 3
+        for attempt in range(endpoint_attempts):
             folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
             local_path = folder / f"juicewrld{suffix}"
             total_bytes = 0
-            # Host connection can take longer than the default; retry transient
-            # connection/read failures before falling back to the original file.
-            timeout = aiohttp.ClientTimeout(total=360, sock_connect=60, sock_read=90)
+            # Radio uses a short per-candidate budget and moves on quickly;
+            # manual requests retain the longer timeout and retries.
+            timeout = (
+                aiohttp.ClientTimeout(total=35, sock_connect=10, sock_read=25)
+                if radio_fast
+                else aiohttp.ClientTimeout(total=360, sock_connect=60, sock_read=90)
+            )
             try:
                 async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                     async with session.get(
@@ -3736,7 +3764,7 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_error = exc
                 shutil.rmtree(folder, ignore_errors=True)
-                if attempt < 2:
+                if attempt < endpoint_attempts - 1:
                     await asyncio.sleep(1.5 * (attempt + 1))
             except Exception as exc:
                 shutil.rmtree(folder, ignore_errors=True)
@@ -3748,15 +3776,150 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
     raise ValueError("The Juice WRLD API could not provide playable audio.")
 
 
-async def _fetch_random_jw_track(requester: str, avoid_title: str = "") -> Track:
-    """Pick a random song, avoiding the previous radio title when possible."""
-    payload = await _juicewrld_api_get("/files/list-all/")
-    entries = _juicewrld_items(payload)
-    audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+# Catalog caches: in-memory for same-process radio rotations and JSON on disk
+# so a restarted bot can usually pick a track without waiting for list-all again.
+_jw_radio_catalog_cache: list[tuple[str, dict]] = []
+_jw_radio_catalog_cache_at = 0.0
+_jw_radio_catalog_cache_loaded = False
+_jw_radio_catalog_lock = asyncio.Lock()
+_JW_RADIO_CATALOG_TTL_SECONDS = 6 * 60 * 60
+
+
+def _load_jw_radio_catalog_disk_cache() -> None:
+    """Load the last known playable file list; a stale cache is better than a hang."""
+    global _jw_radio_catalog_cache, _jw_radio_catalog_cache_at, _jw_radio_catalog_cache_loaded
+    if _jw_radio_catalog_cache_loaded:
+        return
+    _jw_radio_catalog_cache_loaded = True
+    try:
+        cached = json.loads(JUICEWRLD_CATALOG_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or not isinstance(cached.get("files"), list):
+            return
+        files = []
+        for row in cached["files"]:
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                continue
+            info = row.get("info") if isinstance(row.get("info"), dict) else {}
+            files.append((row["path"], info))
+        if files:
+            _jw_radio_catalog_cache = files
+            _jw_radio_catalog_cache_at = float(cached.get("cached_at", 0) or 0)
+            age = max(0, int(time.time() - _jw_radio_catalog_cache_at))
+            print(f"[JuiceWRLD Radio] Loaded {len(files)} cached audio file(s) (cache age {age}s).")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"[JuiceWRLD Radio] Could not read catalog cache: {type(exc).__name__}: {exc}")
+
+
+async def _refresh_jw_radio_catalog(progress_callback=None) -> list[tuple[str, dict]]:
+    """Fetch and persist the playable-file list using short timeouts."""
+    global _jw_radio_catalog_cache, _jw_radio_catalog_cache_at
+    async with _jw_radio_catalog_lock:
+        # Another concurrent caller may have refreshed it while this task waited.
+        if _jw_radio_catalog_cache and time.time() - _jw_radio_catalog_cache_at < _JW_RADIO_CATALOG_TTL_SECONDS:
+            return _jw_radio_catalog_cache
+        last_error = None
+        audio_files = []
+        for endpoint in ("/files/list-all/", "/files/browse/"):
+            try:
+                payload = await _juicewrld_api_get(endpoint, timeout_seconds=15, retries=1)
+                entries = _juicewrld_items(payload)
+                audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+                if audio_files:
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError) as exc:
+                last_error = exc
+                print(f"[JuiceWRLD Radio] Fast catalog request {endpoint} failed: {type(exc).__name__}: {exc}")
+        if not audio_files:
+            if last_error:
+                raise last_error
+            raise ValueError("The Juice WRLD API did not list any playable audio files.")
+
+        now = time.time()
+        _jw_radio_catalog_cache = audio_files
+        _jw_radio_catalog_cache_at = now
+        try:
+            JUICEWRLD_CATALOG_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "cached_at": now,
+                "files": [{"path": path, "info": info} for path, info in audio_files],
+            }
+            tmp_path = JUICEWRLD_CATALOG_CACHE_FILE.with_suffix(
+                JUICEWRLD_CATALOG_CACHE_FILE.suffix + ".tmp"
+            )
+            tmp_path.write_text(json.dumps(cache_payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(JUICEWRLD_CATALOG_CACHE_FILE)
+            print(f"[JuiceWRLD Radio] Cached {len(audio_files)} playable audio file(s).")
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"[JuiceWRLD Radio] Could not save catalog cache: {type(exc).__name__}: {exc}")
+        return audio_files
+
+
+async def _get_jw_radio_catalog(progress_callback=None) -> list[tuple[str, dict]]:
+    """Use cached catalog immediately; refresh in the background when it is stale."""
+    global _jw_radio_catalog_cache
+    _load_jw_radio_catalog_disk_cache()
+    now = time.time()
+    if _jw_radio_catalog_cache:
+        age = max(0, now - _jw_radio_catalog_cache_at)
+        if age < _JW_RADIO_CATALOG_TTL_SECONDS:
+            return _jw_radio_catalog_cache
+        # Stale-while-revalidate: start immediately with the known list and
+        # refresh it for the next radio session/rotation.
+        try:
+            task = asyncio.create_task(_refresh_jw_radio_catalog(progress_callback=None))
+            task.add_done_callback(
+                lambda completed: print(
+                    f"[JuiceWRLD Radio] Background catalog refresh failed: {type(completed.exception()).__name__}: {completed.exception()}"
+                ) if not completed.cancelled() and completed.exception() else None
+            )
+        except RuntimeError:
+            pass
+        return _jw_radio_catalog_cache
+    return await _refresh_jw_radio_catalog(progress_callback=progress_callback)
+
+
+async def _fetch_random_jw_track(
+    requester: str,
+    avoid_title: str = "",
+    progress_callback=None,
+) -> Track:
+    """Pick a random song, avoiding the previous radio title when possible.
+
+    progress_callback, when supplied, receives (title, description) updates so
+    a slow catalog or download request never leaves the radio embed ambiguous.
+    """
+    async def report(title: str, description: str) -> None:
+        if progress_callback is not None:
+            try:
+                await progress_callback(title, description)
+            except Exception as exc:
+                # A Discord status edit failing should not prevent music playback.
+                print(f"[JuiceWRLD Radio] Status update failed: {type(exc).__name__}: {exc}")
+
+    _load_jw_radio_catalog_disk_cache()
+    if _jw_radio_catalog_cache:
+        await report(
+            "⚡ Using cached Juice WRLD catalog…",
+            f"Loaded **{len(_jw_radio_catalog_cache)}** playable file(s) from the local cache, so radio can skip the slow catalog request.",
+        )
+    else:
+        await report(
+            "📡 Checking Juice WRLD catalog…",
+            "No local catalog cache exists yet. Checking the API with a short timeout so radio can move on quickly if it stalls.",
+        )
+    audio_files = await _get_jw_radio_catalog(progress_callback=progress_callback)
+    # Re-apply the skip filters on cached entries as a guard against old cache data.
+    audio_files = [
+        (path, info) for path, info in audio_files
+        if Path(path).suffix.casefold() in {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+        and not _jw_is_beat_or_instrumental(path, info)
+        and not _jw_is_fanmade_or_altered(path, info)
+    ]
     if not audio_files:
-        payload = await _juicewrld_api_get("/files/browse/")
-        entries = _juicewrld_items(payload)
-        audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+        # Cache could be stale or contain only files now rejected by the filters.
+        audio_files = await _refresh_jw_radio_catalog(progress_callback=progress_callback)
     if not audio_files:
         raise ValueError("The Juice WRLD API did not list any playable audio files.")
 
@@ -3774,19 +3937,33 @@ async def _fetch_random_jw_track(requester: str, avoid_title: str = "") -> Track
         audio_files = different_titles
 
     random.shuffle(audio_files)
+    candidates = audio_files[:5]
     errors = []
+    await report(
+        "🎵 Catalog loaded — choosing a track…",
+        f"Found **{len(audio_files)}** playable file(s). I'll try up to **{len(candidates)}** candidates and skip unavailable files.",
+    )
     # Don't let a single dead/slow host path prevent radio from starting.
-    for path, file_info in audio_files[:8]:
+    for index, (path, file_info) in enumerate(candidates, start=1):
         selected = dict(file_info) if isinstance(file_info, dict) else {}
         selected["path"] = path
         selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+        await report(
+            f"⬇️ Preparing track ({index}/{len(candidates)})…",
+            f"Trying **{discord.utils.escape_markdown(Path(path).stem[:160])}**. If a file is unavailable, I'll automatically skip to another candidate.",
+        )
         try:
-            return await _download_juicewrld_track(selected, requester)
+            track = await _download_juicewrld_track(selected, requester, radio_fast=True)
+            await report(
+                "✅ Track downloaded — starting radio…",
+                f"Prepared **{discord.utils.escape_markdown(track.title[:180])}**. Adding it to the shared music queue now.",
+            )
+            return track
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
             errors.append(f"{Path(path).name}: {type(exc).__name__}")
             print(f"[JuiceWRLD Radio] Skipping unavailable file {path!r}: {type(exc).__name__}: {exc}")
     raise RuntimeError(
-        "The API listed files, but the first 8 random audio downloads failed. "
+        "The API listed files, but the first 5 random compressed-audio downloads failed. "
         + "; ".join(errors[:4])
     )
 
@@ -3822,7 +3999,7 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
 
     status_message = await ctx.send(embed=discord.Embed(
         title="📻 Starting Juice WRLD Radio…",
-        description="Finding a playable track and preparing the audio.",
+        description="Connecting to voice, then checking the catalog for a playable track.",
         color=JUICE_COLOR,
     ))
     try:
@@ -3830,6 +4007,37 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
     except Exception as exc:
         await _set_music_status(ctx, status_message, "⚠️ Couldn't start radio", str(exc), color=discord.Color.orange().value)
         return
+
+    # Live progress state is also used by a heartbeat so the embed keeps giving
+    # feedback if the API or a remote audio host stalls between stage updates.
+    progress_state = {
+        "title": "📡 Checking Juice WRLD catalog…",
+        "description": "Contacting the API for the available audio-file list.",
+        "updated_at": asyncio.get_running_loop().time(),
+    }
+
+    async def report_radio_progress(title: str, description: str) -> None:
+        progress_state["title"] = title
+        progress_state["description"] = description
+        progress_state["updated_at"] = asyncio.get_running_loop().time()
+        await _set_music_status(ctx, status_message, title, description, color=JUICE_COLOR)
+
+    async def radio_progress_heartbeat() -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(12)
+            now = loop.time()
+            if now - progress_state["updated_at"] >= 20:
+                # Keep the original phase visible and clarify that the operation
+                # is still waiting on an API/audio response, not silently frozen.
+                heartbeat_description = (
+                    progress_state["description"]
+                    + "\n\n⏳ Still waiting on the API/audio host. Temporary timeouts are retried automatically."
+                )
+                await _set_music_status(
+                    ctx, status_message, progress_state["title"], heartbeat_description, color=JUICE_COLOR
+                )
+                progress_state["updated_at"] = now
 
     # Activate before fetching so ~play and ~jwplay cannot race the radio start.
     jw_radio_active.add(guild_id)
@@ -3841,8 +4049,11 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
         queued_track = get_queue(guild_id).popleft()
         clean_temp_file(queued_track.local_path)
     await ctx.typing()
+    heartbeat_task = asyncio.create_task(radio_progress_heartbeat())
     try:
-        track = await _fetch_random_jw_track("Juice WRLD Radio")
+        track = await _fetch_random_jw_track(
+            "Juice WRLD Radio", progress_callback=report_radio_progress
+        )
     except Exception as exc:
         jw_radio_active.discard(guild_id)
         jw_radio_starting.discard(guild_id)
@@ -3854,6 +4065,11 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
             color=discord.Color.red().value,
         )
     finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
         jw_radio_starting.discard(guild_id)
 
     # If someone disabled radio while the initial file was downloading, don't
