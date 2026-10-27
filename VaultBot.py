@@ -2545,6 +2545,110 @@ class JuiceWRLDSongView(discord.ui.View):
 # juicewrld.io group-buy archive. It is an informational archive; it does not
 # expose or link sellers/payment methods.
 JUICEWRLD_GROUP_BUYS_URL = "https://juicewrld.io/groupbuys"
+# Save a successful archive read so a temporary Cloudflare block does not make
+# the command unavailable after the first successful lookup. Use /data on hosts
+# that provide persistent storage; otherwise fall back to the system temp dir.
+JUICEWRLD_GROUP_BUY_CACHE_FILE = Path(os.getenv(
+    "JUICEWRLD_GROUP_BUY_CACHE_FILE",
+    str(Path("/data/juicewrld_groupbuys_cache.json")
+        if Path("/data").exists()
+        else Path(tempfile.gettempdir()) / "juicewrld_groupbuys_cache.json")
+))
+
+# Small bootstrap snapshot taken from the visible archive on 2026-10-27. This is
+# used only when juicewrld.io blocks requests AND no saved cache exists. The
+# snapshot is intentionally labeled as a fallback in Discord; it is not live.
+_JUICEWRLD_GROUP_BUY_BOOTSTRAP = [
+    {
+        "title": "Calm Down",
+        "url": "https://juicewrld.io/song/calm-down-out",
+        "text": "Calm Down Murciélago Leaked aka Murciélago Hosted by Bravura Finished Oct 24, 2026",
+        "goal": "$20,000", "outcome": "Finished", "date": "Oct 24, 2026",
+    },
+    {
+        "title": "Wraith",
+        "url": "https://juicewrld.io/song/wraith-drfl",
+        "text": "Wraith Leaked Hosted by Bravura Finished Oct 16, 2026",
+        "goal": "$10,000", "outcome": "Finished", "date": "Oct 16, 2026",
+    },
+    {
+        "title": "Boast",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Boast Leaked Party Song is unbounced Finished Sep 30, 2026",
+        "goal": "$8,500", "outcome": "Finished", "date": "Sep 30, 2026",
+    },
+    {
+        "title": "Introvert",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Introvert Luv 2 Hosted by strives in OG File Hub Finished Sep 23, 2026",
+        "goal": "$2,500", "outcome": "Finished", "date": "Sep 23, 2026",
+    },
+    {
+        "title": "Blink-182 & Devil Horns ProTools Session",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Blink-182 Devil Horns ProTools Session Finished Jun 3, 2026",
+        "goal": "$3,000", "outcome": "Finished", "date": "Jun 3, 2026",
+    },
+    {
+        "title": "OKAY!! ProTools Session",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "OKAY!! ProTools Session Group buy from strives Finished May 14, 2026",
+        "goal": "$3,000", "outcome": "Finished", "date": "May 14, 2026",
+    },
+    {
+        "title": "Open Up",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Open Up Make The News Blind Finished Mar 14, 2026",
+        "goal": "$15,000", "outcome": "Finished", "date": "Mar 14, 2026",
+    },
+    {
+        "title": "Mula*",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Mula 1772 Moon Friends Blind Finished Feb 9, 2026",
+        "goal": "$10,000", "outcome": "Finished", "date": "Feb 9, 2026",
+    },
+    {
+        "title": "Cold Winters*",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Cold Winters FIFA Blind Finished Feb 4, 2026",
+        "goal": "$18,250", "outcome": "Finished", "date": "Feb 4, 2026",
+    },
+    {
+        "title": "Be Here*",
+        "url": JUICEWRLD_GROUP_BUYS_URL,
+        "text": "Be Here In The Mix Blind Finished Jan 21, 2026",
+        "goal": "$15,000", "outcome": "Finished", "date": "Jan 21, 2026",
+    },
+]
+
+
+def _load_juicewrld_group_buy_fallback():
+    """Prefer a previously fetched archive; otherwise return the bootstrap snapshot."""
+    try:
+        cached = json.loads(JUICEWRLD_GROUP_BUY_CACHE_FILE.read_text(encoding="utf-8"))
+        if isinstance(cached, list):
+            valid = [
+                item for item in cached
+                if isinstance(item, dict) and item.get("title") and item.get("url")
+            ]
+            if valid:
+                return valid
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    # Copy the dicts so callers can't mutate the module-level bootstrap data.
+    return [dict(item) for item in _JUICEWRLD_GROUP_BUY_BOOTSTRAP]
+
+
+def _save_juicewrld_group_buy_cache(items):
+    """Cache parsed public archive metadata; cache failures must not break the command."""
+    try:
+        path = JUICEWRLD_GROUP_BUY_CACHE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[JuiceWRLD] Could not save group-buy cache: {exc!r}")
 
 
 class _JuiceWRLDGroupBuyHTMLParser(HTMLParser):
@@ -2677,62 +2781,95 @@ async def _fetch_juicewrld_group_buys():
             })
             if len(items) >= 30:
                 break
+    if items:
+        _save_juicewrld_group_buy_cache(items)
     return items
 
 
 @bot.command(name="jwgb")
 async def juicewrld_group_buy(ctx: commands.Context, *, query: Optional[str] = None):
-    """Show the newest Juice WRLD group buy, or search loaded archive entries."""
+    """Show the newest Juice WRLD group buy, or search archive entries."""
+    fallback_used = False
     try:
-        items = await _fetch_juicewrld_group_buys()
+        try:
+            items = await _fetch_juicewrld_group_buys()
+            if not items:
+                print("[JuiceWRLD] Group-buy page parsed no entries; using saved/bootstrap fallback.")
+                items = _load_juicewrld_group_buy_fallback()
+                fallback_used = True
+        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError) as exc:
+            # Cloudflare can return HTTP 403 challenges to server-side clients.
+            # Use a saved snapshot (or a small bootstrap snapshot on first run).
+            print(f"[JuiceWRLD] Live group-buy lookup failed; using fallback: {exc!r}")
+            items = _load_juicewrld_group_buy_fallback()
+            fallback_used = True
+
         if not items:
             await ctx.send(
-                "I couldn't read the group-buy entries from juicewrld.io right now. "
+                "I couldn't read the group-buy archive, and no saved fallback data is available. "
                 f"You can open the archive directly: {JUICEWRLD_GROUP_BUYS_URL}"
             )
             return
 
         if query and query.strip():
             needle = query.strip().casefold()
-            matches = [item for item in items if needle in item["title"].casefold() or needle in item["text"].casefold()]
+            matches = [
+                item for item in items
+                if needle in str(item.get("title", "")).casefold()
+                or needle in str(item.get("text", "")).casefold()
+            ]
             if not matches:
-                await ctx.send(
-                    f"No matching group-buy entry was found in the entries currently available to VaultBot for **{discord.utils.escape_markdown(query[:100])}**.\n"
-                    f"Search the complete archive here: {JUICEWRLD_GROUP_BUYS_URL}"
-                )
+                if fallback_used:
+                    message = (
+                        f"The live archive is currently unavailable, and **{discord.utils.escape_markdown(query[:100])}** "
+                        "wasn't found in VaultBot's saved/backup entries. The fallback may not contain the full archive."
+                    )
+                else:
+                    message = (
+                        f"No matching group-buy entry was found for **{discord.utils.escape_markdown(query[:100])}**."
+                    )
+                await ctx.send(f"{message}\nSearch the complete archive: {JUICEWRLD_GROUP_BUYS_URL}")
                 return
             item = matches[0]
-            heading = f"🧃 Juice WRLD Group Buy: {item['title']}"
+            heading = f"🧃 Juice WRLD Group Buy: {item.get('title', 'Unknown')}"
         else:
             item = items[0]
-            heading = f"🧃 Latest Juice WRLD Group Buy: {item['title']}"
+            heading = f"🧃 Latest Juice WRLD Group Buy: {item.get('title', 'Unknown')}"
+
+        item_url = item.get("url") or JUICEWRLD_GROUP_BUYS_URL
+        description = (
+            f"**Entry:** [{discord.utils.escape_markdown(str(item.get('title', 'Unknown')))}]({item_url})\n"
+            "Historical archive information only; no seller or payment links are provided."
+        )
+        if fallback_used:
+            description += (
+                "\n\n⚠️ **Backup data:** juicewrld.io blocked the live request, so this result comes "
+                "from the last saved archive or a limited snapshot checked on Oct 27, 2026. It may be outdated."
+            )
 
         embed = discord.Embed(
             title=heading[:256],
-            url=item.get("url") or JUICEWRLD_GROUP_BUYS_URL,
-            description=(
-                f"**Entry:** [{discord.utils.escape_markdown(item['title'])}]({item.get('url') or JUICEWRLD_GROUP_BUYS_URL})\n"
-                "Archive details from juicewrld.io; this command does not provide seller or payment links."
-            ),
+            url=item_url,
+            description=description,
             color=JUICE_COLOR,
         )
-        embed.add_field(name="Goal", value=item.get("goal") or "Not listed", inline=True)
-        embed.add_field(name="Outcome", value=item.get("outcome") or "Not recorded", inline=True)
-        embed.add_field(name="Date", value=item.get("date") or "Not listed", inline=True)
-        embed.set_footer(text="Source: juicewrld.io/groupbuys • Archive information only")
+        embed.add_field(name="Goal", value=str(item.get("goal") or "Not listed"), inline=True)
+        embed.add_field(name="Outcome", value=str(item.get("outcome") or "Not recorded"), inline=True)
+        embed.add_field(name="Date", value=str(item.get("date") or "Not listed"), inline=True)
+        footer = "Source: juicewrld.io/groupbuys • Archive information only"
+        if fallback_used:
+            footer += " • Backup snapshot; not live"
+        embed.set_footer(text=footer[:2048])
         await ctx.send(embed=embed)
 
     except asyncio.CancelledError:
         raise
-    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError) as exc:
-        print(f"[JuiceWRLD] Group-buy lookup failed: {exc!r}")
-        await ctx.send(
-            "The juicewrld.io group-buy archive couldn't be reached right now. "
-            f"Try again later: {JUICEWRLD_GROUP_BUYS_URL}"
-        )
     except Exception as exc:
         print(f"[JuiceWRLD] Unexpected group-buy lookup error: {type(exc).__name__}: {exc!r}")
-        await ctx.send("I couldn't load the group-buy entry. Please try again later.")
+        await ctx.send(
+            "I couldn't load the group-buy entry right now. "
+            f"You can still open the archive: {JUICEWRLD_GROUP_BUYS_URL}"
+        )
 
 
 @bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
