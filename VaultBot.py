@@ -6442,6 +6442,164 @@ async def _wwe_resume_after_ready():
 
 
 # =============================================================================
+# VAULT CONTROL CENTER — lightweight interactive dashboard
+# =============================================================================
+VAULT_RED = discord.Color.from_rgb(255, 35, 55)
+VAULT_STARTED_MONOTONIC = time.monotonic()
+
+
+def _vault_uptime_text() -> str:
+    seconds = max(0, int(time.monotonic() - VAULT_STARTED_MONOTONIC))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {seconds}s"
+
+
+def _vault_memory_mb() -> Optional[float]:
+    """Read resident memory from procfs without adding a dependency."""
+    try:
+        with open('/proc/self/status', 'r', encoding='utf-8') as handle:
+            for line in handle:
+                if line.startswith('VmRSS:'):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _vault_control_embed(page: str, guild: Optional[discord.Guild]) -> discord.Embed:
+    embed = discord.Embed(color=VAULT_RED, timestamp=datetime.now(timezone.utc))
+    embed.set_author(name='VAULTBOT  /  CONTROL CENTER', icon_url=bot.user.display_avatar.url if bot.user else None)
+    if page == 'overview':
+        embed.title = '▰ SYSTEM OVERVIEW'
+        embed.description = (
+            '**Your server. Your systems. One vault.**\n'
+            'Use the controls below to explore VaultBot modules and shortcuts.'
+        )
+        embed.add_field(name='STATUS', value='🟢 Connected' if bot.is_ready() else '🟠 Connecting', inline=True)
+        embed.add_field(name='LATENCY', value=f'{round(bot.latency * 1000)} ms' if bot.is_ready() else 'Checking…', inline=True)
+        embed.add_field(name='UPTIME', value=_vault_uptime_text(), inline=True)
+        if guild:
+            embed.add_field(name='SERVER', value=guild.name[:100], inline=True)
+            embed.add_field(name='CHANNELS', value=str(len(guild.channels)), inline=True)
+            embed.add_field(name='MEMBERS', value=str(guild.member_count or len(guild.members)), inline=True)
+        else:
+            embed.add_field(name='SERVERS', value=str(len(bot.guilds)), inline=True)
+        memory = _vault_memory_mb()
+        embed.add_field(name='MEMORY', value=f'{memory} MB RSS' if memory is not None else 'Not available on this host', inline=True)
+        embed.add_field(name='PREFIX', value=f'`{PREFIX}`', inline=True)
+        embed.add_field(name='SLASH COMMANDS', value='`/vault`  •  `/help`  •  `/ping`', inline=True)
+        embed.set_footer(text='VAULTBOT • CONTROL CENTER • REDLINE SYSTEMS')
+    elif page == 'systems':
+        embed.title = '▰ ACTIVE SYSTEMS'
+        embed.description = 'Your connected VaultBot modules at a glance.'
+        modules = [
+            ('🎮 GAME RADAR', '`/freestuff` • `/patchnotes`', 'Free offers, Steam game announcements, and supported game feeds.'),
+            ('🔴 WWE ALERTS', '`~wwe status` • `~wwe setup`', 'RAW and PLE schedule checks plus Streamed metadata checks for SmackDown.'),
+            ('🎵 MUSIC ENGINE', '`~play` • `~queue` • `~nowplaying`', 'Voice playback and queue controls.'),
+            ('🖤 JUICE WRLD', '`~jwsong`', 'Song/catalog search and optional tracker notifications.'),
+            ('🛡️ MODERATION', '`~ban` • `~timeout` • `~clear`', 'Server moderation tools, subject to permissions.'),
+        ]
+        for name, commands_text, description in modules:
+            embed.add_field(name=name, value=f'{description}\n{commands_text}', inline=False)
+        embed.set_footer(text='Some notification systems require channel/API settings before they can deliver alerts.')
+    elif page == 'community':
+        embed.title = '▰ COMMUNITY & PROGRESSION'
+        embed.description = 'Member-facing tools for activity, recognition, and server discovery.'
+        embed.add_field(name='🏆 XP & LEVELS', value='`/xp` — open the XP hub\n`/rank` — view a member rank\n`/leaderboard` — browse rankings', inline=False)
+        embed.add_field(name='✨ ACHIEVEMENTS', value='`/achievements` — browse achievement progress\n`/xpreward` — configure level role rewards (staff)', inline=False)
+        embed.add_field(name='👤 MEMBER PROFILES', value='`~profile` — view member information and available profile stats.', inline=False)
+        embed.add_field(name='📣 COMMUNITY TOOLS', value='`/announce` — staff announcements\n`/musicdrop` — publish a music release with link buttons', inline=False)
+        embed.set_footer(text='Role rewards and administration actions still follow Discord permissions.')
+    elif page == 'commands':
+        embed.title = '▰ QUICK COMMANDS'
+        embed.description = 'Jump straight into the features you use most.'
+        embed.add_field(name='START HERE', value='`/vault` or `~vault` — this dashboard\n`/help` or `~help` — full interactive command guide\n`/ping` — connection latency', inline=False)
+        embed.add_field(name='GAMING & ALERTS', value='`/freestuff` • `/patchnotes` • `~wwe status`', inline=False)
+        embed.add_field(name='MUSIC', value='`~play <song>` • `~queue` • `~skip` • `~pause` • `~resume` • `~nowplaying`', inline=False)
+        embed.add_field(name='XP & COMMUNITY', value='`/xp` • `/rank` • `/leaderboard` • `/achievements`', inline=False)
+        embed.add_field(name='OWNER / STAFF', value='Use `/help` for the full list and permission notes. Admin-only actions remain permission-gated.', inline=False)
+        embed.set_footer(text='Tip: Discord slash commands appear in the / command picker.')
+    else:  # refresh uses overview content
+        return _vault_control_embed('overview', guild)
+    return embed
+
+
+class VaultControlCenterView(discord.ui.View):
+    """A small, in-message dashboard; no extra background task or database."""
+    def __init__(self, guild_id: Optional[int]):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.message: Optional[discord.Message] = None
+
+    def _guild(self) -> Optional[discord.Guild]:
+        return bot.get_guild(self.guild_id) if self.guild_id else None
+
+    async def _show(self, interaction: discord.Interaction, page: str):
+        await interaction.response.edit_message(embed=_vault_control_embed(page, self._guild()), view=self)
+
+    @discord.ui.button(label='Overview', emoji='▰', style=discord.ButtonStyle.danger, row=0)
+    async def overview_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, 'overview')
+
+    @discord.ui.button(label='Systems', emoji='⚙️', style=discord.ButtonStyle.secondary, row=0)
+    async def systems_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, 'systems')
+
+    @discord.ui.button(label='Community', emoji='🏆', style=discord.ButtonStyle.secondary, row=0)
+    async def community_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, 'community')
+
+    @discord.ui.button(label='Commands', emoji='⌘', style=discord.ButtonStyle.secondary, row=0)
+    async def commands_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, 'commands')
+
+    @discord.ui.button(label='Refresh', emoji='🔄', style=discord.ButtonStyle.success, row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._show(interaction, 'overview')
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def _send_vault_control_center(send_callable, guild: Optional[discord.Guild]):
+    view = VaultControlCenterView(guild.id if guild else None)
+    message = await send_callable(embed=_vault_control_embed('overview', guild), view=view)
+    view.message = message
+
+
+@bot.command(name='vault', aliases=['dashboard', 'controlcenter'])
+async def vault_control_center(ctx: commands.Context):
+    """Open VaultBot's interactive control center."""
+    await _send_vault_control_center(ctx.send, ctx.guild)
+
+
+@bot.tree.command(name='vault', description='Open the interactive VaultBot Control Center')
+async def slash_vault_control_center(interaction: discord.Interaction):
+    view = VaultControlCenterView(interaction.guild_id)
+    await interaction.response.send_message(
+        embed=_vault_control_embed('overview', interaction.guild),
+        view=view,
+        ephemeral=False,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
+
+
+# =============================================================================
 # 13. STARTUP
 # =============================================================================
 if not TOKEN:
