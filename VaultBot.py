@@ -45,7 +45,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse, urlencode, urljoin
+from urllib.parse import urlparse, urlencode, urljoin, urlsplit, urlunsplit, quote
+import io
 
 import aiohttp
 import discord
@@ -3582,11 +3583,93 @@ async def juicewrld_lyrics_search(ctx: commands.Context, *, phrase: str):
         await ctx.send("The Juice WRLD catalog is unavailable right now. Please try lyric search again later.")
 
 
+# --- Cover-art helpers -------------------------------------------------------
+# Discord has to fetch embed images itself, and many hosts block, rate-limit or
+# slowly serve Discord's image proxy, which leaves a blank embed. VaultBot now
+# downloads each cover first and uploads it as an attachment, then falls back to
+# the direct URL, then to a plain link, so a result is never silently blank.
+_JW_IMG_EXT = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+_JW_IMG_MAGIC = (
+    (b"\xff\xd8\xff", "jpg"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+)
+
+
+def _jw_clean_url(url: str) -> str:
+    """Percent-encode a URL's path safely (spaces, #, non-ASCII...) without double-encoding.
+
+    A raw '#' in an image URL from the API is treated as part of the filename (a fragment is
+    meaningless for an image fetch), so it becomes %23 instead of silently cutting the URL short.
+    """
+    url = (url or "").strip()
+    match = re.match(r"^(https?://[^/?#]+)(.*)$", url, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return url.replace(" ", "%20")
+    host, rest = match.groups()
+    path, sep, query = rest.partition("?")
+    path = quote(path, safe="/%:@+,;=~!$&'()*")
+    query = quote(query, safe="=&%:@+,;/?~!$'()*")
+    return host + path + (sep + query if sep else "")
+
+
+def _jw_sniff_image_ext(data: bytes) -> Optional[str]:
+    """Identify the image type from its bytes, so a wrong Content-Type header doesn't matter."""
+    for magic, ext in _JW_IMG_MAGIC:
+        if data.startswith(magic):
+            return ext
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes: int = 8_000_000):
+    """Download one image. Returns (bytes, extension) or None; failures are logged, never raised."""
+    try:
+        async with session.get(_jw_clean_url(url), allow_redirects=True) as resp:
+            if resp.status != 200:
+                print(f"[jwcover] HTTP {resp.status} for {url}", flush=True)
+                return None
+            data = await resp.content.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                print(f"[jwcover] too large (> {max_bytes} bytes): {url}", flush=True)
+                return None
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            ext = _jw_sniff_image_ext(data) or _JW_IMG_EXT.get(ctype)
+            if not ext:
+                print(f"[jwcover] not an image (content-type {ctype!r}): {url}", flush=True)
+                return None
+            return data, ext
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        print(f"[jwcover] download failed for {url}: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+async def _jw_download_images(urls: list):
+    """Download many images concurrently (max 4 at a time)."""
+    sem = asyncio.Semaphore(4)
+    timeout = aiohttp.ClientTimeout(total=25)
+    headers = {"User-Agent": "VaultBot/1.0 (Juice WRLD lookup)", "Accept": "image/*,*/*;q=0.8"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async def one(url):
+            async with sem:
+                return await _jw_download_image(session, url)
+        return await asyncio.gather(*(one(u) for u in urls))
+
+
 @bot.command(name="jwcover")
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def juicewrld_cover(ctx: commands.Context, *, query: str):
     """Search community cover art and display every result directly in Discord."""
     try:
+        await ctx.typing()
         payload = await _jw_get_json_url("https://wrld.pure0.lol/api/covers/", params={"search": query})
         images = payload.get("images", []) if isinstance(payload, dict) else []
         urls, seen = [], set()
@@ -3595,11 +3678,12 @@ async def juicewrld_cover(ctx: commands.Context, *, query: str):
                 image = image.get("url") or image.get("image") or image.get("src")
             if not isinstance(image, str) or not image.strip():
                 continue
-            image = image.strip().replace(" ", "%20")
+            image = image.strip()
             if image.startswith("/"):
                 image = "https://wrld.pure0.lol" + image
             if not image.startswith(("https://", "http://")):
                 continue
+            image = _jw_clean_url(image)
             if image.lower() not in seen:
                 urls.append(image)
                 seen.add(image.lower())
@@ -3608,16 +3692,47 @@ async def juicewrld_cover(ctx: commands.Context, *, query: str):
         if not urls:
             return await ctx.send(f"No cover art found for **{discord.utils.escape_markdown(query[:100])}**. The cover service may also be unavailable.")
 
-        # Discord allows up to 10 embeds per message. Give each cover its own image
-        # embed, so users can see the results in chat rather than opening each link.
         await ctx.send(f"🎨 Found **{len(urls)}** cover image(s) for **{discord.utils.escape_markdown(query[:100])}**:")
-        for offset in range(0, len(urls), 10):
-            embeds = []
-            for index, url in enumerate(urls[offset:offset + 10], start=offset + 1):
-                embed = discord.Embed(title=f"Cover art: {query[:150]} · {index}/{len(urls)}", color=JUICE_COLOR)
-                embed.set_image(url=url)
+        results = await _jw_download_images(urls)
+
+        # Group results into messages: max 10 embeds and under the server's upload limit.
+        guild_limit = getattr(ctx.guild, "filesize_limit", None) if ctx.guild else None
+        budget = max(1_000_000, (guild_limit or 10_000_000) - 500_000)
+        batches, current, current_size = [], [], 0
+        for index, (url, result) in enumerate(zip(urls, results), start=1):
+            size = len(result[0]) if result else 0
+            if current and (len(current) >= 10 or current_size + size > budget):
+                batches.append(current)
+                current, current_size = [], 0
+            current.append((index, url, result))
+            current_size += size
+        if current:
+            batches.append(current)
+
+        for batch in batches:
+            embeds, files, fallback_embeds = [], [], []
+            for index, url, result in batch:
+                title = f"Cover art: {query[:150]} · {index}/{len(urls)}"
+                embed = discord.Embed(title=title, color=JUICE_COLOR)
+                direct = discord.Embed(title=title, color=JUICE_COLOR)
+                direct.set_image(url=url)
+                fallback_embeds.append(direct)
+                if result:
+                    data, ext = result
+                    filename = f"cover_{index}.{ext}"
+                    files.append(discord.File(io.BytesIO(data), filename=filename))
+                    embed.set_image(url=f"attachment://{filename}")
+                else:
+                    # Couldn't download it ourselves: try the direct URL and give a clickable link too.
+                    embed.set_image(url=url)
+                    embed.description = f"[Open image]({url})"
                 embeds.append(embed)
-            await ctx.send(embeds=embeds)
+            try:
+                await ctx.send(embeds=embeds, files=files)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                # e.g. missing Attach Files permission or upload too large -> fall back to plain URL embeds.
+                print(f"[jwcover] attachment send failed ({type(exc).__name__}: {exc}); using direct URLs", flush=True)
+                await ctx.send(embeds=fallback_embeds)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         print(f"[JuiceWRLD] Cover lookup failed: {type(exc).__name__}: {exc}")
         await ctx.send("The cover-art service is unavailable right now. Please try again later.")
