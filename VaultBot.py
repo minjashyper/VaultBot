@@ -6543,7 +6543,7 @@ class VaultControlCenterView(discord.ui.View):
     async def _show(self, interaction: discord.Interaction, page: str):
         await interaction.response.edit_message(embed=_vault_control_embed(page, self._guild()), view=self)
 
-    @discord.ui.button(label='Overview', emoji='▰', style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(label='Overview', emoji='🔴', style=discord.ButtonStyle.danger, row=0)
     async def overview_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._show(interaction, 'overview')
 
@@ -6555,7 +6555,7 @@ class VaultControlCenterView(discord.ui.View):
     async def community_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._show(interaction, 'community')
 
-    @discord.ui.button(label='Commands', emoji='⌘', style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label='Commands', emoji='📋', style=discord.ButtonStyle.secondary, row=0)
     async def commands_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._show(interaction, 'commands')
 
