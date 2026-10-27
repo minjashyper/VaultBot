@@ -54,6 +54,7 @@ import yt_dlp
 
 import html
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from email.utils import parsedate_to_datetime
 from datetime import timezone
 from discord import app_commands
@@ -1189,6 +1190,7 @@ HELP_PAGES: list[dict] = [
             ("`~profile [@member]`", "Shows a member profile embed with their avatar, account creation date, server join date, server tenure, roles, VaultBot XP/message stats when available, and joins/departures recorded since this feature was installed."),
             ("Random chat replies", "When enabled, VaultBot may occasionally reply to messages containing greetings (`hello`, `hi`, `hey`, `yo`), morning/night greetings, laughter, or game-related words. It can also react to image uploads with a short reply. Replies are randomized, only considered in servers, and are limited by a per-channel cooldown."),
             ("Current auto-reply settings", "Auto-replies are enabled in this build with a 40% chance after a matching message and a 60-second per-channel cooldown. These values and the reply text can be changed in the script (`AUTO_REPLY_ENABLED`, `AUTO_REPLY_CHANCE`, `AUTO_REPLY_COOLDOWN`, `AUTO_REPLY_KEYWORDS`, and `AUTO_REPLY_IMAGES`)."),
+            ("WWE Live Alerts", "Use `~wwe setup` to create a dedicated #wwe channel and enable automatic RAW, SmackDown and Premium Live Event notifications. `~wwe status` shows the schedule monitor health."),
             ("Other background features", "The Juice WRLD tracker can post unseen tracker changes when `JUICEWRLD_CHANNEL_ID` is configured. Patch Notes, FreeStuff, and Twitch Drops each have their own host settings and setup requirements on their dedicated pages. Features that depend on external feeds or API keys remain unavailable until configured and reachable."),
         ],
     },
@@ -5700,7 +5702,85 @@ async def _xp_process_message(message: discord.Message):
             pass
 
 
+def _xp_reconcile_member(guild_id: int, user_id: int) -> dict:
+    """Safely reconcile one member's profile from its XP event log.
+
+    Never lowers existing stats: if the event log appears incomplete, leave the
+    profile untouched and report that fact for diagnostics.
+    """
+    with _xp_connect() as db:
+        profile = db.execute(
+            "SELECT total_xp,messages,active_days,last_active_day FROM xp_profiles WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        aggregate = db.execute(
+            """SELECT COALESCE(SUM(amount),0) AS total_xp,
+                      COUNT(*) AS messages,
+                      COUNT(DISTINCT substr(created_at,1,10)) AS active_days,
+                      MAX(substr(created_at,1,10)) AS last_active_day
+               FROM xp_events WHERE guild_id=? AND user_id=?""",
+            (guild_id, user_id),
+        ).fetchone()
+
+        event_xp = int(aggregate["total_xp"] or 0)
+        event_messages = int(aggregate["messages"] or 0)
+        event_days = int(aggregate["active_days"] or 0)
+        event_last_day = aggregate["last_active_day"] or ""
+        profile_xp = int(profile["total_xp"]) if profile else 0
+        profile_messages = int(profile["messages"]) if profile else 0
+        profile_days = int(profile["active_days"]) if profile else 0
+
+        # Only rebuild when the durable event ledger can account for at least
+        # every existing statistic. This avoids destroying older data if event
+        # history is incomplete.
+        safe_to_rebuild = event_messages > 0 and (
+            event_xp >= profile_xp
+            and event_messages >= profile_messages
+            and event_days >= profile_days
+        )
+        repaired = False
+        if safe_to_rebuild and (
+            profile is None
+            or event_xp != profile_xp
+            or event_messages != profile_messages
+            or event_days != profile_days
+            or (profile and str(profile["last_active_day"] or "") != event_last_day)
+        ):
+            db.execute(
+                """INSERT INTO xp_profiles(guild_id,user_id,total_xp,messages,active_days,last_active_day)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                     total_xp=excluded.total_xp,
+                     messages=excluded.messages,
+                     active_days=excluded.active_days,
+                     last_active_day=excluded.last_active_day""",
+                (guild_id, user_id, event_xp, event_messages, event_days, event_last_day),
+            )
+            repaired = True
+
+        current = db.execute(
+            "SELECT total_xp,messages,active_days,last_active_day FROM xp_profiles WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()
+        return {
+            "profile_exists": current is not None,
+            "total_xp": int(current["total_xp"]) if current else 0,
+            "messages": int(current["messages"]) if current else 0,
+            "active_days": int(current["active_days"]) if current else 0,
+            "last_active_day": str(current["last_active_day"] or "") if current else "",
+            "event_xp": event_xp,
+            "event_messages": event_messages,
+            "event_days": event_days,
+            "event_last_day": event_last_day,
+            "repaired": repaired,
+            "event_history_incomplete": bool(profile and not safe_to_rebuild and (
+                event_xp != profile_xp or event_messages != profile_messages or event_days != profile_days
+            )),
+        }
+
+
 def _xp_profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    _xp_reconcile_member(guild.id, member.id)
     with _xp_connect() as db:
         row = db.execute("SELECT * FROM xp_profiles WHERE guild_id=? AND user_id=?", (guild.id, member.id)).fetchone()
         rank = db.execute("SELECT COUNT(*)+1 FROM xp_profiles WHERE guild_id=? AND total_xp > COALESCE((SELECT total_xp FROM xp_profiles WHERE guild_id=? AND user_id=?),-1)", (guild.id, guild.id, member.id)).fetchone()[0]
@@ -5928,9 +6008,65 @@ async def xp_hub(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("Use this command inside a server.", ephemeral=True); return
     view = XPHubView(interaction.guild, interaction.user.id)
-    embed = discord.Embed(title="⬡ VAULTBOT • LEVELING HUB", description="Earn XP by chatting, level up, unlock achievements, and climb the leaderboard.\n\nChoose an option below to get started.", color=XP_COLOR)
+    embed = discord.Embed(title="⬡ VAULTBOT • LEVELING HUB", description="Earn XP by chatting, level up, unlock achievements, and climb the leaderboard.\n\nChoose an option below to get started.\nUse `/xpcheck` for a private XP data diagnostic.", color=XP_COLOR)
     embed.set_footer(text="VAULTBOT SYSTEMS  •  XP / LEVELS / ACHIEVEMENTS")
     await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+
+
+@bot.tree.command(name="xpcheck", description="Privately check and safely reconcile your own XP stats")
+async def xp_check(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this command inside a server.", ephemeral=True)
+        return
+
+    result = _xp_reconcile_member(interaction.guild.id, interaction.user.id)
+    settings = _xp_settings(interaction.guild.id)
+    ignored_channels = [x.strip() for x in str(settings.get("ignored_channels", "")).split(",") if x.strip()]
+    ignored_roles = [x.strip() for x in str(settings.get("ignored_roles", "")).split(",") if x.strip()]
+    user_role_ids = {role.id for role in getattr(interaction.user, "roles", [])}
+    try:
+        ignored_channel_ids = {int(value) for value in ignored_channels}
+        ignored_role_ids = {int(value) for value in ignored_roles}
+    except ValueError:
+        ignored_channel_ids, ignored_role_ids = set(), set()
+    currently_ignored_channel = interaction.channel_id in ignored_channel_ids
+    has_ignored_role = bool(user_role_ids & ignored_role_ids)
+    if result["repaired"]:
+        status = "✅ Reconciled your profile using your saved XP event history."
+    elif result["event_history_incomplete"]:
+        status = "⚠️ Your profile and event history disagree, but I left your data unchanged because the event history may be incomplete."
+    elif result["event_messages"] == 0 and result["total_xp"] > 0:
+        status = "⚠️ You have saved XP but no event history. I left your data unchanged."
+    elif not result["profile_exists"]:
+        status = "ℹ️ No XP profile or XP event history exists for your account in this server yet."
+    else:
+        status = "✅ Your profile matches the saved XP event history."
+
+    embed = discord.Embed(title="🔎 Your VaultBot XP Diagnostics", description=status, color=XP_COLOR)
+    embed.add_field(name="Your Discord ID", value=f"`{interaction.user.id}`", inline=True)
+    embed.add_field(name="Server ID", value=f"`{interaction.guild.id}`", inline=True)
+    embed.add_field(name="Current profile", value=(
+        f"XP: **{result['total_xp']:,}**\n"
+        f"Messages: **{result['messages']:,}**\n"
+        f"Active days: **{result['active_days']:,}**\n"
+        f"Last active day: **{result['last_active_day'] or '—'}**"
+    ), inline=False)
+    embed.add_field(name="Saved event history", value=(
+        f"XP total: **{result['event_xp']:,}**\n"
+        f"Events/messages: **{result['event_messages']:,}**\n"
+        f"Active days: **{result['event_days']:,}**\n"
+        f"Last event day: **{result['event_last_day'] or '—'}**"
+    ), inline=False)
+    embed.add_field(name="XP tracking settings", value=(
+        f"Enabled: **{'Yes' if settings.get('enabled', 1) else 'No'}**\n"
+        f"Ignored channels configured: **{len(ignored_channels)}**\n"
+        f"Ignored roles configured: **{len(ignored_roles)}**\n"
+        f"This channel ignored: **{'Yes' if currently_ignored_channel else 'No'}**\n"
+        f"You have an ignored role: **{'Yes' if has_ignored_role else 'No'}**\n"
+        f"XP database: **configured**"
+    ), inline=False)
+    embed.set_footer(text="Private to you • No other member's XP data was changed")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="rank", description="View your rank or another member's VaultBot XP profile")
@@ -5998,6 +6134,311 @@ async def xp_reward(interaction: discord.Interaction, level: app_commands.Range[
 # Initialize storage before the bot starts. Errors fail loudly instead of silently losing XP.
 _xp_init_db()
 print(f"[XP] SQLite storage ready: {XP_DB_PATH}")
+
+
+
+# =============================================================================
+# WWE LIVE ALERTS (lightweight schedule polling + persistent deduplication)
+# =============================================================================
+# The official WWE upcoming-events page is the source of event dates/times.
+# RAW/SmackDown have known weekly start times as a fallback. PLE alerts are only
+# sent when the official page exposes a parseable date AND start time.
+WWE_SCHEDULE_URL = "https://www.wwe.com/article/wwe-upcoming-events"
+WWE_RAW_URL = "https://www.netflix.com/"
+WWE_DATA_FILE = Path(os.getenv(
+    "WWE_DATA_FILE",
+    str(Path(os.getenv("VAULTBOT_DATA_DIR", "/data")) / "wwe_alerts.json")
+))
+WWE_POLL_MINUTES = _positive_int_env("WWE_POLL_MINUTES", 5)
+WWE_TZ_NAME = "America/New_York"
+WWE_OFFICIAL_URL = "https://www.wwe.com/shows"
+
+class _WWETextParser(HTMLParser):
+    """Extract readable text from the WWE schedule page without extra deps."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip = 0
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript"):
+            self._skip += 1
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript") and self._skip:
+            self._skip -= 1
+    def handle_data(self, data):
+        if not self._skip and data and data.strip():
+            self.parts.append(" ".join(data.split()))
+
+_WWE_STATE = {"channel_id": None, "sent": [], "last_schedule_ok": None, "last_error": None}
+_WWE_SENT_LIMIT = 500
+
+def _wwe_load_state():
+    global _WWE_STATE
+    try:
+        raw = json.loads(WWE_DATA_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            _WWE_STATE.update(raw)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[WWE] Couldn't read saved state: {type(exc).__name__}: {exc}")
+
+def _wwe_save_state():
+    WWE_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WWE_DATA_FILE.with_suffix(WWE_DATA_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(_WWE_STATE, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(WWE_DATA_FILE)
+
+def _wwe_extract_events(page_text: str):
+    """Return only schedule entries with a clear WWE show, date, and ET start."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(WWE_TZ_NAME)
+    text = re.sub(r"\s+", " ", page_text)
+    # The page's visible editorial schedule commonly lists entries like:
+    # 'Raw on Netflix Monday, Oct. 26, 2026 ... 8 p.m. ET on Netflix'.
+    date_re = re.compile(
+        r"(?P<weekday>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,?\s+"
+        r"(?P<month>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+"
+        r"(?P<day>\d{1,2}),?\s+(?P<year>20\d{2})", re.I)
+    month_map = {m.lower(): i for i, m in enumerate(("January February March April May June July August September October November December").split(), 1)}
+    def mon_num(m):
+        key = m.lower().rstrip('.')
+        for full, n in month_map.items():
+            if key.startswith(full[:3]): return n
+        return None
+    found = {}
+    for match in date_re.finditer(text):
+        before = text[max(0, match.start()-180):match.start()]
+        after = text[match.end():min(len(text), match.end()+260)]
+        context = (before + " " + after).lower()
+        if re.search(r"\braw\b", context):
+            show = "WWE RAW"
+            default_hour = 20
+        elif re.search(r"smackdown", context):
+            show = "WWE SmackDown"
+            default_hour = 20
+        elif re.search(r"crown jewel|survivor series|wrestlemania|royal rumble|summer slam|summerslam|money in the bank|bad blood|night of champions|backlash|clash at the castle|king and queen of the ring|elimination chamber", context):
+            show = "WWE Premium Live Event"
+            default_hour = None
+        else:
+            continue
+        # Don't guess PLE start times. For weekly shows, use the published
+        # broadcast start when it appears, otherwise the normal ET start.
+        time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\s*(?:ET|EST|EDT|Eastern)\b", after, re.I)
+        if time_match:
+            hour = int(time_match.group(1)) % 12
+            if time_match.group(3).lower().startswith('p'): hour += 12
+            minute = int(time_match.group(2) or 0)
+        elif default_hour is not None:
+            hour, minute = default_hour, 0
+        else:
+            continue
+        try:
+            dt = datetime(int(match.group('year')), mon_num(match.group('month')), int(match.group('day')), hour, minute, tzinfo=tz)
+        except (ValueError, TypeError):
+            continue
+        if dt <= datetime.now(tz) - timedelta(minutes=10):
+            continue
+        # Keep nearby title to distinguish multiple same-day events.
+        title = re.sub(r"\s+", " ", before[-100:]).strip(" -|:;")
+        if show == "WWE Premium Live Event":
+            title_match = re.search(r"(Crown Jewel|Survivor Series(?::\s*WarGames)?|WrestleMania(?:\s+\d+)?|Royal Rumble|SummerSlam|Money in the Bank|Bad Blood|Night of Champions|Backlash|Clash at the Castle|King and Queen of the Ring|Elimination Chamber)[^.!?]{0,40}", title, re.I)
+            if title_match:
+                show = title_match.group(0).strip()
+        key = f"{show}|{dt.isoformat()}"
+        found[key] = {"key": key, "name": show, "start": dt.isoformat(), "url": WWE_OFFICIAL_URL}
+    return list(found.values())
+
+async def _wwe_fetch_schedule():
+    timeout = aiohttp.ClientTimeout(total=12)
+    headers = {"User-Agent": "VaultBot WWE Alerts/1.0 (+official schedule checker)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(WWE_SCHEDULE_URL, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            raw = await resp.text(errors="replace")
+    parser = _WWETextParser()
+    parser.feed(raw)
+    events = _wwe_extract_events(" ".join(parser.parts))
+    if not events:
+        raise ValueError("The official WWE page did not expose parseable upcoming event times; no alerts were guessed.")
+    return events
+
+async def _wwe_fetch_streamed_smackdown_events():
+    """Use Streamed's event metadata to find scheduled/live SmackDown listings.
+
+    This uses match titles and timestamps only; it does not resolve or redistribute
+    stream URLs. The API's listings are third-party data and may be incomplete.
+    """
+    base = "https://streamed.pk/api/matches"
+    timeout = aiohttp.ClientTimeout(total=10)
+    headers = {"User-Agent": "VaultBot WWE Alerts/1.0"}
+    collected = {}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for endpoint in (f"{base}/all-today", f"{base}/live"):
+            try:
+                async with session.get(endpoint, headers=headers) as resp:
+                    resp.raise_for_status()
+                    payload = await resp.json(content_type=None)
+                if not isinstance(payload, list):
+                    continue
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title") or "").strip()
+                    # Avoid matching unrelated wrestling events or WWE RAW/PLEs.
+                    if not re.search(r"\bsmack\s*down\b", title, re.I):
+                        continue
+                    raw_date = item.get("date")
+                    try:
+                        stamp = float(raw_date)
+                        # Docs specify Unix milliseconds; tolerate seconds if returned.
+                        if stamp < 10_000_000_000:
+                            stamp *= 1000
+                        start_utc = datetime.fromtimestamp(stamp / 1000, tz=timezone.utc)
+                    except (TypeError, ValueError, OSError, OverflowError):
+                        continue
+                    if start_utc < datetime.now(timezone.utc) - timedelta(minutes=10):
+                        continue
+                    key = f"WWE SmackDown|{start_utc.isoformat()}"
+                    collected[key] = {
+                        "key": key,
+                        "name": "WWE SmackDown",
+                        "start": start_utc.isoformat(),
+                        "url": "https://www.netflix.com/",
+                        "source": "Streamed API event metadata",
+                    }
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                print(f"[WWE] Streamed API check failed for {endpoint.rsplit('/', 1)[-1]}: {type(exc).__name__}")
+    return list(collected.values())
+
+async def _wwe_post_alert(channel, event, phase):
+    start = datetime.fromisoformat(event["start"])
+    unix = int(start.timestamp())
+    if phase == "soon":
+        title = f"🔔 {event['name']} starts in 15 minutes!"
+        description = f"Get ready — **{event['name']}** is scheduled to begin <t:{unix}:R>."
+    else:
+        title = f"🔴 {event['name']} is starting now!"
+        description = f"**{event['name']}** is scheduled to start now. <t:{unix}:F>"
+    embed = discord.Embed(title=title, description=description, color=discord.Color.from_rgb(111, 30, 210))
+    embed.add_field(name="Official WWE schedule", value=f"[Check event details]({event.get('url') or WWE_OFFICIAL_URL})", inline=False)
+    embed.set_footer(text="VaultBot • WWE Live Alerts • Times shown in Eastern Time")
+    await channel.send(content="@here", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
+
+@tasks.loop(minutes=WWE_POLL_MINUTES)
+async def _wwe_alert_loop():
+    channel_id = _WWE_STATE.get("channel_id")
+    if not channel_id:
+        return
+    try:
+        # Official schedule remains primary for RAW and PLEs. Streamed's public
+        # event metadata supplements SmackDown detection when it lists a timestamp.
+        events = []
+        official_error = None
+        try:
+            events.extend(await _wwe_fetch_schedule())
+        except Exception as exc:
+            official_error = f"Official WWE schedule: {type(exc).__name__}: {exc}"
+            print(f"[WWE] {official_error}")
+        try:
+            streamed_events = await _wwe_fetch_streamed_smackdown_events()
+            known = {event.get("key") for event in events}
+            events.extend(event for event in streamed_events if event.get("key") not in known)
+        except Exception as exc:
+            print(f"[WWE] Streamed API check failed: {type(exc).__name__}: {exc}")
+        if not events:
+            raise ValueError(official_error or "No parseable WWE events were returned by the configured schedule sources.")
+        _WWE_STATE["last_schedule_ok"] = datetime.now(timezone.utc).isoformat()
+        _WWE_STATE["last_error"] = None if not official_error else official_error
+        channel = bot.get_channel(int(channel_id))
+        if channel is None:
+            try: channel = await bot.fetch_channel(int(channel_id))
+            except (discord.HTTPException, ValueError, TypeError):
+                print("[WWE] Saved #wwe channel is unavailable; use ~wwe setup to configure it again.")
+                return
+        now = datetime.now(timezone.utc)
+        sent = set(_WWE_STATE.get("sent", []))
+        changed = False
+        for event in events:
+            start = datetime.fromisoformat(event["start"]).astimezone(timezone.utc)
+            delta = (start - now).total_seconds()
+            phase = "soon" if 0 <= delta <= 15 * 60 else ("start" if -(WWE_POLL_MINUTES * 60) <= delta < 0 else None)
+            if not phase:
+                continue
+            token = f"{event['key']}|{phase}"
+            if token in sent:
+                continue
+            try:
+                await _wwe_post_alert(channel, event, phase)
+                sent.add(token); changed = True
+            except discord.HTTPException as exc:
+                print(f"[WWE] Failed to send {event['name']} alert: {exc}")
+        if changed:
+            _WWE_STATE["sent"] = list(sent)[-_WWE_SENT_LIMIT:]
+            _wwe_save_state()
+    except Exception as exc:
+        _WWE_STATE["last_error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[WWE] Schedule check failed: {_WWE_STATE['last_error']}")
+
+@_wwe_alert_loop.before_loop
+async def _wwe_before_loop():
+    await bot.wait_until_ready()
+
+@bot.group(name="wwe", invoke_without_command=True)
+@commands.guild_only()
+async def wwe_group(ctx):
+    await ctx.send("WWE Live Alerts: use `~wwe setup` to create/configure #wwe, or `~wwe status` to check the monitor.")
+
+@wwe_group.command(name="setup")
+@commands.has_guild_permissions(manage_channels=True)
+async def wwe_setup(ctx):
+    """Create or reuse #wwe and enable scheduled WWE notifications."""
+    channel = discord.utils.get(ctx.guild.text_channels, name="wwe")
+    if channel is None:
+        overwrites = {ctx.guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)}
+        me = ctx.guild.me
+        if me:
+            overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True)
+        try:
+            channel = await ctx.guild.create_text_channel("wwe", overwrites=overwrites, topic="Automated WWE RAW, SmackDown and Premium Live Event alerts from VaultBot.")
+        except discord.HTTPException as exc:
+            await ctx.send(f"I couldn't create #wwe. Check my **Manage Channels** permission. Details: `{exc}`")
+            return
+    _WWE_STATE["channel_id"] = channel.id
+    _wwe_save_state()
+    if not _wwe_alert_loop.is_running():
+        _wwe_alert_loop.start()
+    await ctx.send(f"✅ WWE Live Alerts are enabled in {channel.mention}. I'll check WWE's official schedule for RAW and PLEs, plus Streamed's event metadata for SmackDown. Alerts are sent 15 minutes before a listed start and at start time when a reliable event timestamp is available. Check `~wwe status` for health.")
+
+@wwe_group.command(name="status")
+@commands.guild_only()
+async def wwe_status(ctx):
+    channel_id = _WWE_STATE.get("channel_id")
+    channel = ctx.guild.get_channel(int(channel_id)) if channel_id else None
+    last_ok = _WWE_STATE.get("last_schedule_ok") or "Not checked yet"
+    err = _WWE_STATE.get("last_error")
+    embed = discord.Embed(title="WWE Live Alerts Status", color=discord.Color.from_rgb(111, 30, 210))
+    embed.add_field(name="Alert channel", value=channel.mention if channel else "Not configured — use `~wwe setup`", inline=False)
+    embed.add_field(name="Last successful schedule check", value=str(last_ok), inline=False)
+    embed.add_field(name="Polling interval", value=f"{WWE_POLL_MINUTES} minutes", inline=True)
+    embed.add_field(name="Last error", value=(err[:1000] if err else "None reported"), inline=False)
+    await ctx.send(embed=embed)
+
+@wwe_group.error
+async def wwe_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need **Manage Channels** permission to set up WWE alerts.")
+    else:
+        await ctx.send("WWE alerts hit an error. Check the bot console and `~wwe status`.")
+
+# Load saved channel + duplicate-prevention state. Polling starts once setup is
+# used and restarts safely after reconnect/restart.
+_wwe_load_state()
+@bot.listen("on_ready")
+async def _wwe_resume_after_ready():
+    if _WWE_STATE.get("channel_id") and not _wwe_alert_loop.is_running():
+        _wwe_alert_loop.start()
 
 
 # =============================================================================
