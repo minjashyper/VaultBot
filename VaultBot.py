@@ -75,6 +75,10 @@ JUICE_COLOR = discord.Color.from_rgb(123, 44, 191)
 
 # Music settings.
 DEFAULT_VOLUME = 0.5
+MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amplified
+# MP3 bitrate requested from the Juice WRLD API for playback/radio (was 160k). If the API rejects it,
+# VaultBot automatically falls back to the original file, so this is safe to change.
+JW_PLAYBACK_BITRATE = "320k"
 ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
 MAX_UPLOAD_MB = 20
 
@@ -688,7 +692,11 @@ async def play_next(ctx: commands.Context) -> None:
                 except RuntimeError as exc:
                     print(f"Could not schedule next track: {exc}")
 
-            voice.play(source, after=after_playback)
+            try:
+                voice.play(source, after=after_playback, **_opus_play_kwargs(voice))
+            except TypeError:
+                # Older discord.py without Opus encoder options: play with the defaults.
+                voice.play(source, after=after_playback)
             # Keep the voice player's audio source alive and announce the track.
             await update_now_playing(ctx, track)
         except Exception as error:
@@ -700,6 +708,22 @@ async def play_next(ctx: commands.Context) -> None:
             current_tracks.pop(guild_id, None)
             # Try the next queued track.
             bot.loop.call_soon(lambda: asyncio.create_task(play_next(ctx)))
+
+
+def _opus_play_kwargs(voice) -> dict:
+    """Better Opus encoding for music.
+
+    discord.py's defaults are 128 kbps, signal_type 'auto' and 15% expected packet loss
+    (which makes the encoder spend bits on error protection instead of sound quality).
+    Use the voice channel's own bitrate as the target (capped at 384 kbps), tell the
+    encoder the signal is music, and assume only a little packet loss.
+    """
+    kbps = 128
+    try:
+        kbps = int((getattr(voice.channel, "bitrate", 128000) or 128000) // 1000)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return {"bitrate": max(64, min(kbps, 384)), "signal_type": "music", "expected_packet_loss": 0.05}
 
 
 async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
@@ -1148,7 +1172,7 @@ HELP_PAGES: list[dict] = [
                 "Pause the current song and pick it back up right where you left off.",
             ),
             (
-                f"`{PREFIX}volume <0-100>`  •  `{PREFIX}vol`",
+                f"`{PREFIX}volume <0-{MAX_VOLUME_PERCENT}>`  •  `{PREFIX}vol`",
                 "Sets the playback volume for this server. "
                 f"The default is {int(DEFAULT_VOLUME * 100)}%. "
                 "The change applies instantly, even mid-song.",
@@ -2300,13 +2324,14 @@ async def resume_command(ctx: commands.Context):
 async def volume_command(ctx: commands.Context, percent: int):
     if not ctx.guild:
         return
-    if not 0 <= percent <= 100:
-        return await ctx.send("Choose a volume from 0 to 100.")
+    if not 0 <= percent <= MAX_VOLUME_PERCENT:
+        return await ctx.send(f"Choose a volume from 0 to {MAX_VOLUME_PERCENT}.")
     volumes[ctx.guild.id] = percent / 100
     voice = ctx.guild.voice_client
     if voice and voice.source and isinstance(voice.source, discord.PCMVolumeTransformer):
         voice.source.volume = percent / 100
-    await ctx.send(f"🔊 Volume set to **{percent}%**.")
+    note = " Above 100% is amplified and may sound distorted." if percent > 100 else ""
+    await ctx.send(f"🔊 Volume set to **{percent}%**.{note}")
 
 
 @bot.command(name="nowplaying", aliases=["np", "current"])
@@ -3828,7 +3853,7 @@ async def _download_juicewrld_track(
     # stream endpoint. The API may reject transcoding with HTTP 406 for files
     # that it can still serve normally; radio must not give up on those tracks.
     attempts = [
-        ("files/download-compressed/", {"path": remote_path, "bitrate": "160k"}, ".mp3"),
+        ("files/download-compressed/", {"path": remote_path, "bitrate": JW_PLAYBACK_BITRATE}, ".mp3"),
         ("files/download/", {"path": remote_path}, original_suffix),
     ]
     headers = {"Accept": "audio/*, application/octet-stream"}
