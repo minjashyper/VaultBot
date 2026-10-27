@@ -1011,7 +1011,7 @@ HELP_PAGES: list[dict] = [
         ),
         "fields": [
             (
-                f"`{PREFIX}jwplay <song>`",
+                f"`{PREFIX}jwplay` / `{PREFIX}jwp` (random) or `{PREFIX}jwplay <song>`",
                 "Searches for a Juice WRLD catalog match and queues its available audio in the same queue as "
                 f"`{PREFIX}play`. It will not interrupt a song already playing.\n"
                 f"Example: `{PREFIX}jwplay lucid dreams`",
@@ -3450,8 +3450,9 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
     """Search the Juice WRLD API and queue its audio in the shared music player."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
-    if not query.strip():
-        return await ctx.send(f"Usage: `{PREFIX}jwplay song name` — adds a Juice WRLD catalog track to the shared queue.")
+    # With no argument, choose a random playable file. Supplying a title still
+    # searches for that specific song; the `random` keyword remains optional.
+    wants_random = not query.strip() or query.strip().casefold() == "random"
 
     # Use the same per-guild Discord voice connection as ~play; never create
     # a second player or a second queue for this command.
@@ -3462,6 +3463,28 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
 
     await ctx.typing()
     try:
+        if wants_random:
+            payload = await _juicewrld_api_get("/files/list-all/")
+            entries = _juicewrld_items(payload)
+            audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+            if not audio_files:
+                # Some API deployments expose playable files through browse
+                # even when the flat listing is unavailable or empty.
+                payload = await _juicewrld_api_get("/files/browse/")
+                entries = _juicewrld_items(payload)
+                audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+            if not audio_files:
+                return await ctx.send(
+                    "I couldn't find any playable audio files in the Juice WRLD API listing right now."
+                )
+            path, file_info = random.choice(audio_files)
+            selected = dict(file_info) if isinstance(file_info, dict) else {}
+            selected["path"] = path
+            selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+            track = await _download_juicewrld_track(selected, ctx.author.display_name)
+            await queue_track(ctx, track)
+            return
+
         payload = await _juicewrld_api_get(
             "/songs/",
             params={"search": query.strip(), "page_size": 25, "versions": "true"},
