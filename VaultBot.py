@@ -39,6 +39,7 @@ import signal
 import sys
 import tempfile
 import time
+import difflib
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1019,9 +1020,16 @@ HELP_PAGES: list[dict] = [
             ),
             (
                 "`~jwgb [song name]`",
-                "Shows the newest group-buy entry from juicewrld.io when used by itself, "
-                "or searches the entries currently loaded by the archive page when a name is supplied. "
-                "The command shows historical metadata only, not seller or payment links.",
+                "Shows the newest group-buy entry from the WRLD group-buy API when used by itself, "
+                "or searches the archive by name. If the API is unavailable, VaultBot falls back to the saved archive snapshot.",
+            ),
+            (
+                "`~jwlyric <song>` / `~jwlyricsearch <phrase>`",
+                "Shows available lyrics for a catalog song, or searches the catalog for songs containing a lyric phrase.",
+            ),
+            (
+                "`~jwcover <song or album>` / `~jwfiles <song>`",
+                "Searches community cover art or the API file browser for matching audio files.",
             ),
             (
                 "📡 Automatic Tracker Feed",
@@ -1355,11 +1363,6 @@ async def on_ready():
         print(f"Command sync failed: {type(error).__name__}: {error}")
 
     _load_juicewrld_state()
-    # One-time diagnostic: check whether the hosting runtime can access the
-    # website RSS feed before we wire it into group-buy updates.
-    if not getattr(bot, "_jw_rss_diagnostic_started", False):
-        bot._jw_rss_diagnostic_started = True
-        asyncio.create_task(_diagnose_juicewrld_rss_feed())
     if JUICEWRLD_CHANNEL_ID:
         if not juicewrld_tracker_task.is_running():
             juicewrld_tracker_task.start()
@@ -2547,57 +2550,6 @@ class JuiceWRLDSongView(discord.ui.View):
                 pass
 
 
-# Diagnostic for the site's published RSS feed. This deliberately does not
-# change ~jwgb behavior yet; first confirm that the bot host can read the feed.
-JUICEWRLD_RSS_FEED_URL = "https://juicewrld.io/feed.xml"
-
-
-async def _diagnose_juicewrld_rss_feed():
-    timeout = aiohttp.ClientTimeout(total=12)
-    headers = {
-        "User-Agent": "VaultBot/1.0 (+https://github.com/minjashyper/VaultBot; RSS feed check)",
-        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(JUICEWRLD_RSS_FEED_URL, allow_redirects=True) as response:
-                content_type = response.headers.get("Content-Type", "unknown")
-                body = await response.text(errors="replace")
-                print(
-                    f"[JuiceWRLD] RSS feed diagnostic: HTTP {response.status}; "
-                    f"content-type={content_type}; bytes={len(body.encode('utf-8', errors='replace'))}."
-                )
-                if response.status != 200:
-                    print(f"[JuiceWRLD] RSS feed is not accessible from this host (HTTP {response.status}).")
-                    return
-                try:
-                    root = ET.fromstring(body)
-                except ET.ParseError as exc:
-                    print(f"[JuiceWRLD] RSS URL returned HTTP 200 but was not valid XML: {exc!r}")
-                    return
-                entries = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}]
-                group_buy_entries = []
-                for entry in entries:
-                    fields = []
-                    for node in entry.iter():
-                        if node.text and node.text.strip():
-                            fields.append(node.text.strip())
-                        for key, value in node.attrib.items():
-                            if key.lower() in {"href", "term"} and value:
-                                fields.append(value.strip())
-                    combined = " ".join(fields).casefold()
-                    if "group buy" in combined or "groupbuy" in combined or "group-buys" in combined:
-                        group_buy_entries.append(entry)
-                print(
-                    f"[JuiceWRLD] RSS feed accessible; parsed {len(entries)} feed entries, "
-                    f"{len(group_buy_entries)} mention group buys."
-                )
-    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError) as exc:
-        print(f"[JuiceWRLD] RSS feed diagnostic failed: {type(exc).__name__}: {exc}")
-    except Exception as exc:
-        print(f"[JuiceWRLD] Unexpected RSS diagnostic error: {type(exc).__name__}: {exc}")
-
-
 # juicewrld.io group-buy archive. It is an informational archive; it does not
 # expose or link sellers/payment methods.
 JUICEWRLD_GROUP_BUYS_URL = "https://juicewrld.io/groupbuys"
@@ -2842,90 +2794,447 @@ async def _fetch_juicewrld_group_buys():
     return items
 
 
+JUICEWRLD_GROUP_BUY_API_URL = "https://wrld.pure0.lol/api/groupbuys"
+
+
+async def _jw_get_json_url(url: str, params: Optional[dict] = None):
+    """Fetch JSON from an absolute API URL without adding browser-challenge workarounds."""
+    timeout = aiohttp.ClientTimeout(total=18)
+    headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (Juice WRLD lookup)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(url, params=params, allow_redirects=True) as response:
+            response.raise_for_status()
+            return await response.json(content_type=None)
+
+
+def _jw_gb_data(payload):
+    if isinstance(payload, dict):
+        entries = payload.get("entries")
+        if isinstance(entries, list):
+            return [item for item in entries if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _jw_normalize_match(value):
+    return "".join(ch.casefold() for ch in str(value or "") if ch.isalnum())
+
+
+def _jw_groupbuy_score(query: str, entry: dict) -> int:
+    q = _jw_normalize_match(query)
+    if not q:
+        return 0
+    names = [entry.get("title"), *(entry.get("alternates") or []), *(entry.get("family") or [])]
+    best = 0
+    for name in names:
+        norm = _jw_normalize_match(name)
+        if not norm:
+            continue
+        if norm == q:
+            return 100
+        if q in norm:
+            best = max(best, 92)
+        elif norm in q:
+            best = max(best, 82)
+        else:
+            best = max(best, round(difflib.SequenceMatcher(None, q, norm).ratio() * 75))
+    return best
+
+
+def _jw_groupbuy_date(entry: dict):
+    gb = entry.get("gb") or entry.get("group") or entry.get("groupbuy_info") or {}
+    if not isinstance(gb, dict):
+        gb = {}
+    raw = gb.get("start_date") or entry.get("start_date") or entry.get("date") or entry.get("created_at") or ""
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _jw_groupbuy_embed(entry: dict, *, latest: bool, stale: bool = False) -> discord.Embed:
+    gb = entry.get("gb") or entry.get("group") or entry.get("groupbuy_info") or {}
+    if not isinstance(gb, dict):
+        gb = {}
+    title = str(entry.get("title") or entry.get("name") or "Unknown group buy").strip()
+    project = entry.get("project") or "Not listed"
+    price = gb.get("price")
+    if isinstance(price, (int, float)):
+        price_text = f"${price:,.0f}" if float(price).is_integer() else f"${price:,.2f}"
+    else:
+        price_text = str(price).strip() if price not in (None, "") else "Not listed"
+        if price_text and not price_text.startswith("$") and price_text != "Not listed":
+            price_text = "$" + price_text
+    start_date = str(gb.get("start_date") or entry.get("start_date") or "Not listed")
+    end_date = str(gb.get("end_date") or entry.get("end_date") or "Not listed")
+    finished = gb.get("finished", entry.get("finished"))
+    if finished is True:
+        status = "Finished"
+    elif finished is False:
+        status = "Not finished"
+    else:
+        status = str(finished or "Not recorded")
+    ogfile = gb.get("ogfile", False)
+    blind = entry.get("blind", False)
+    notes = str(entry.get("additional_info") or gb.get("notes") or gb.get("additional_info") or "").strip()
+    family = entry.get("family") or []
+    alternates = entry.get("alternates") or []
+    link = entry.get("url") or "https://juicewrld.io/groupbuys"
+    heading = f"🧃 {'Latest ' if latest else ''}Juice WRLD Group Buy: {title}"
+    description = f"**Archive entry:** [{discord.utils.escape_markdown(title[:180])}]({link})\nHistorical group-buy information only; no seller or payment links are provided."
+    if stale:
+        description += "\n\n⚠️ **Backup data:** the live API and archive are unavailable; this result may be outdated."
+    embed = discord.Embed(title=heading[:256], url=link, description=description, color=JUICE_COLOR)
+    embed.add_field(name="Goal / Price", value=price_text[:1024], inline=True)
+    embed.add_field(name="Status", value=status[:1024], inline=True)
+    embed.add_field(name="Era / Project", value=str(project)[:1024], inline=True)
+    embed.add_field(name="Start date", value=start_date[:1024], inline=True)
+    embed.add_field(name="End date", value=end_date[:1024], inline=True)
+    embed.add_field(name="Original file", value="Yes" if ogfile is True else ("No" if ogfile is False else str(ogfile))[:1024], inline=True)
+    embed.add_field(name="Blind buy", value="Yes" if blind is True else ("No" if blind is False else str(blind))[:1024], inline=True)
+    extra = []
+    if alternates:
+        extra.append("**AKA:** " + ", ".join(str(x) for x in alternates[:8]))
+    if family:
+        extra.append("**Sold with:** " + ", ".join(str(x) for x in family[:8]))
+    if notes and notes not in {"-", "N/A", "n/a"}:
+        extra.append("**Notes:** " + notes[:700])
+    if extra:
+        embed.add_field(name="Additional information", value="\n".join(extra)[:1024], inline=False)
+    embed.set_footer(text="Source: WRLD group-buy API • Historical information only" + (" • Backup snapshot" if stale else ""))
+    return embed
+
+
 @bot.command(name="jwgb")
+@commands.cooldown(1, 8, commands.BucketType.user)
 async def juicewrld_group_buy(ctx: commands.Context, *, query: Optional[str] = None):
-    """Show the newest Juice WRLD group buy, or search archive entries."""
-    fallback_used = False
+    """Show the newest group buy, or search the group-buy archive by title."""
     try:
         try:
-            items = await _fetch_juicewrld_group_buys()
-            if not items:
-                print("[JuiceWRLD] Group-buy page parsed no entries; using saved/bootstrap fallback.")
-                items = _load_juicewrld_group_buy_fallback()
-                fallback_used = True
-        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError) as exc:
-            # Cloudflare can return HTTP 403 challenges to server-side clients.
-            # Use a saved snapshot (or a small bootstrap snapshot on first run).
-            print(f"[JuiceWRLD] Live group-buy lookup failed; using fallback: {exc!r}")
-            items = _load_juicewrld_group_buy_fallback()
-            fallback_used = True
+            payload = await _jw_get_json_url(JUICEWRLD_GROUP_BUY_API_URL)
+            entries = _jw_gb_data(payload)
+            if entries:
+                if query and query.strip():
+                    ranked = sorted((( _jw_groupbuy_score(query, item), item) for item in entries), key=lambda pair: pair[0], reverse=True)
+                    if not ranked or ranked[0][0] < 55:
+                        await ctx.send(f"No group-buy entry matching **{discord.utils.escape_markdown(query[:100])}** was found in the current API data.\nArchive: {JUICEWRLD_GROUP_BUYS_URL}")
+                        return
+                    selected = ranked[0][1]
+                    await ctx.send(embed=_jw_groupbuy_embed(selected, latest=False))
+                    return
+                # Prefer the newest start date when provided; otherwise preserve the API's order.
+                dated = [(i, _jw_groupbuy_date(item), item) for i, item in enumerate(entries)]
+                if any(date for _, date, _ in dated):
+                    dated.sort(key=lambda row: (row[1] is not None, row[1] or datetime.min, -row[0]), reverse=True)
+                    selected = dated[0][2]
+                else:
+                    selected = entries[0]
+                await ctx.send(embed=_jw_groupbuy_embed(selected, latest=True))
+                return
+            print("[JuiceWRLD] Group-buy API returned no entries; trying the existing archive fallback.")
+        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError, TypeError) as exc:
+            print(f"[JuiceWRLD] WRLD group-buy API failed; trying existing fallback: {type(exc).__name__}: {exc}")
 
+        # The hosting runtime has already confirmed that juicewrld.io challenges its
+        # direct requests (HTTP 403). Avoid repeating a slow blocked request on every
+        # command; serve the saved snapshot/bootstrap if the separate WRLD API fails.
+        items = _load_juicewrld_group_buy_fallback()
+        fallback_used = True
         if not items:
-            await ctx.send(
-                "I couldn't read the group-buy archive, and no saved fallback data is available. "
-                f"You can open the archive directly: {JUICEWRLD_GROUP_BUYS_URL}"
-            )
-            return
-
+            return await ctx.send("I couldn't load group-buy data from either source right now. Please try again later.")
         if query and query.strip():
             needle = query.strip().casefold()
-            matches = [
-                item for item in items
-                if needle in str(item.get("title", "")).casefold()
-                or needle in str(item.get("text", "")).casefold()
-            ]
+            matches = [item for item in items if needle in str(item.get("title", "")).casefold() or needle in str(item.get("text", "")).casefold()]
             if not matches:
-                if fallback_used:
-                    message = (
-                        f"The live archive is currently unavailable, and **{discord.utils.escape_markdown(query[:100])}** "
-                        "wasn't found in VaultBot's saved/backup entries. The fallback may not contain the full archive."
-                    )
-                else:
-                    message = (
-                        f"No matching group-buy entry was found for **{discord.utils.escape_markdown(query[:100])}**."
-                    )
-                await ctx.send(f"{message}\nSearch the complete archive: {JUICEWRLD_GROUP_BUYS_URL}")
-                return
+                status = "The live sources are unavailable and the saved fallback may be incomplete." if fallback_used else "No matching entry was found."
+                return await ctx.send(f"{status} Search the archive directly: {JUICEWRLD_GROUP_BUYS_URL}")
             item = matches[0]
-            heading = f"🧃 Juice WRLD Group Buy: {item.get('title', 'Unknown')}"
         else:
             item = items[0]
-            heading = f"🧃 Latest Juice WRLD Group Buy: {item.get('title', 'Unknown')}"
-
-        item_url = item.get("url") or JUICEWRLD_GROUP_BUYS_URL
-        description = (
-            f"**Entry:** [{discord.utils.escape_markdown(str(item.get('title', 'Unknown')))}]({item_url})\n"
-            "Historical archive information only; no seller or payment links are provided."
-        )
-        if fallback_used:
-            description += (
-                "\n\n⚠️ **Backup data:** juicewrld.io blocked the live request, so this result comes "
-                "from the last saved archive or a limited snapshot checked on Oct 27, 2026. It may be outdated."
-            )
-
         embed = discord.Embed(
-            title=heading[:256],
-            url=item_url,
-            description=description,
+            title=f"🧃 {'Latest ' if not query else ''}Juice WRLD Group Buy: {item.get('title', 'Unknown')}"[:256],
+            url=item.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+            description=(f"**Archive entry:** [{discord.utils.escape_markdown(str(item.get('title', 'Unknown')))}]({item.get('url') or JUICEWRLD_GROUP_BUYS_URL})\nHistorical archive information only; no seller or payment links are provided."
+                        + ("\n\n⚠️ **Backup data:** the live sources are unavailable, so this may be outdated." if fallback_used else "")),
             color=JUICE_COLOR,
         )
         embed.add_field(name="Goal", value=str(item.get("goal") or "Not listed"), inline=True)
         embed.add_field(name="Outcome", value=str(item.get("outcome") or "Not recorded"), inline=True)
         embed.add_field(name="Date", value=str(item.get("date") or "Not listed"), inline=True)
-        footer = "Source: juicewrld.io/groupbuys • Archive information only"
-        if fallback_used:
-            footer += " • Backup snapshot; not live"
-        embed.set_footer(text=footer[:2048])
+        embed.set_footer(text="Source: juicewrld.io/groupbuys" + (" • Backup snapshot; not live" if fallback_used else ""))
         await ctx.send(embed=embed)
-
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         print(f"[JuiceWRLD] Unexpected group-buy lookup error: {type(exc).__name__}: {exc!r}")
-        await ctx.send(
-            "I couldn't load the group-buy entry right now. "
-            f"You can still open the archive: {JUICEWRLD_GROUP_BUYS_URL}"
+        await ctx.send("I couldn't load the group-buy entry right now. Please try again later.")
+
+
+# Adapted for VaultBot from the structure/features of purrre/WRLD-bot.
+# Source data remains owned by its respective providers; only public read endpoints are used.
+_JW_SONGS_CACHE = []
+_JW_SONGS_CACHE_AT = 0.0
+_JW_SONGS_CACHE_TTL = 1800
+
+
+def _jw_song_name(song: dict) -> str:
+    titles = song.get("track_titles") or []
+    if isinstance(titles, str):
+        titles = [titles]
+    return str((titles[0] if titles else None) or song.get("name") or song.get("title") or "Unknown song")
+
+
+def _jw_lyrics_text(song: dict) -> str:
+    value = song.get("lyrics")
+    if isinstance(value, dict):
+        value = value.get("lyrics") or value.get("text")
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return "" if value.casefold() in {"", "none", "null", "n/a", "not available"} else value
+
+
+async def _jw_search_songs(query: str, limit: int = 25):
+    payload = await _juicewrld_api_get("/songs/", params={"search": query, "page_size": limit, "versions": "true"})
+    songs = [item for item in _juicewrld_items(payload) if isinstance(item, dict) and (item.get("id") is not None or item.get("public_id") is not None)]
+    songs.sort(key=lambda item: _jw_song_score(item, query), reverse=True)
+    return songs[:limit]
+
+
+async def _jw_get_song_detail(song: dict) -> dict:
+    song_id = song.get("id")
+    if song_id is None:
+        return song
+    payload = await _juicewrld_api_get(f"/songs/{int(song_id)}/")
+    if isinstance(payload, dict):
+        combined = dict(song)
+        combined.update(payload)
+        return combined
+    return song
+
+
+async def _jw_fetch_song_catalog():
+    """Load a paginated catalog for lyrics search; keep it in memory for 30 minutes."""
+    global _JW_SONGS_CACHE, _JW_SONGS_CACHE_AT
+    now = time.monotonic()
+    if _JW_SONGS_CACHE and now - _JW_SONGS_CACHE_AT < _JW_SONGS_CACHE_TTL:
+        return _JW_SONGS_CACHE
+    catalog, seen = [], set()
+    for page in range(1, 81):
+        payload = await _juicewrld_api_get("/songs/", params={"page": page, "page_size": 100, "versions": "true"})
+        items = _juicewrld_items(payload)
+        if not items:
+            break
+        before = len(seen)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id") or item.get("public_id") or item.get("name") or "")
+            if key and key not in seen:
+                seen.add(key)
+                catalog.append(item)
+        if isinstance(payload, dict) and "next" in payload:
+            if not payload.get("next"):
+                break
+        elif len(items) < 100:
+            break
+        if len(seen) == before:
+            break
+    if catalog:
+        _JW_SONGS_CACHE = catalog
+        _JW_SONGS_CACHE_AT = now
+    return _JW_SONGS_CACHE
+
+
+async def _jw_send_lyrics(ctx, song: dict):
+    lyrics = _jw_lyrics_text(song)
+    if not lyrics:
+        return await ctx.send(f"No lyrics are available for **{discord.utils.escape_markdown(_jw_song_name(song))}** in the catalog.")
+    # Respect Discord embed limits by splitting into manageable pages.
+    chunks, current = [], ""
+    for line in lyrics.splitlines() or [lyrics]:
+        if len(current) + len(line) + 1 > 3800 and current:
+            chunks.append(current.rstrip())
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current.rstrip())
+    title = _jw_song_name(song)[:180]
+    max_parts = min(len(chunks), 8)
+    for i, chunk in enumerate(chunks[:max_parts], start=1):
+        page_title = f"Lyrics — {title}" if len(chunks) == 1 else f"Lyrics — {title} ({i}/{len(chunks)})"
+        embed = discord.Embed(title=page_title[:256], description=chunk[:4000], color=JUICE_COLOR)
+        embed.set_footer(text="Source: JuiceWRLDAPI • Lyrics and metadata are provider-supplied")
+        await ctx.send(embed=embed)
+    if len(chunks) > max_parts:
+        await ctx.send(f"Lyrics were shortened because the entry is unusually long ({len(chunks)} parts total).")
+
+
+@bot.command(name="jwlyric")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def juicewrld_lyrics(ctx: commands.Context, *, query: str):
+    """Find a song by title and display its available lyrics."""
+    try:
+        songs = await _jw_search_songs(query)
+        if not songs:
+            return await ctx.send(f"No Juice WRLD catalog entries found for **{discord.utils.escape_markdown(query[:100])}**.")
+        # Check the highest-ranked matches in case search results omit lyrics until detail is fetched.
+        for candidate in songs[:5]:
+            song = await _jw_get_song_detail(candidate)
+            if _jw_lyrics_text(song):
+                return await _jw_send_lyrics(ctx, song)
+        return await ctx.send(f"I found **{discord.utils.escape_markdown(_jw_song_name(songs[0]))}**, but the API did not return lyrics for that entry.")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Lyrics lookup failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The Juice WRLD lyric service is unavailable right now. Please try again later.")
+
+
+@bot.command(name="jwlyricsearch")
+@commands.cooldown(1, 12, commands.BucketType.user)
+async def juicewrld_lyrics_search(ctx: commands.Context, *, phrase: str):
+    """Search catalog lyrics for a phrase and list likely matching songs."""
+    query_norm = _jw_normalize_match(phrase)
+    if len(query_norm) < 5:
+        return await ctx.send(f"Give me a longer lyric phrase. Example: `{PREFIX}jwlyricsearch wishing well`.")
+    try:
+        await ctx.typing()
+        songs = await _jw_fetch_song_catalog()
+        if not songs:
+            return await ctx.send("The Juice WRLD catalog could not be loaded, so lyric search is unavailable right now.")
+        matches = []
+        q_words = {w for w in re.findall(r"[a-z0-9]+", phrase.casefold()) if len(w) > 2}
+        for song in songs:
+            lyrics = _jw_lyrics_text(song)
+            if not lyrics:
+                continue
+            norm_lyrics = _jw_normalize_match(lyrics)
+            score, matched_line = 0, ""
+            if query_norm in norm_lyrics:
+                score = 100
+                for line in lyrics.splitlines():
+                    if query_norm in _jw_normalize_match(line):
+                        matched_line = line.strip()
+                        break
+            else:
+                best_ratio = 0.0
+                for line in lyrics.splitlines():
+                    clean = line.strip()
+                    if not clean or len(clean) < max(5, len(phrase) // 2) or len(clean) > len(phrase) * 3:
+                        continue
+                    line_norm = _jw_normalize_match(clean)
+                    ratio = difflib.SequenceMatcher(None, query_norm, line_norm).ratio()
+                    if q_words and q_words.issubset(set(re.findall(r"[a-z0-9]+", clean.casefold()))):
+                        ratio = max(ratio, 0.84)
+                    if ratio > best_ratio:
+                        best_ratio, matched_line = ratio, clean
+                if best_ratio >= 0.84:
+                    score = round(best_ratio * 100)
+            if score:
+                matches.append((score, song, matched_line))
+        matches.sort(key=lambda item: item[0], reverse=True)
+        # Exact phrase hits first and keep the output readable.
+        seen_titles, results = set(), []
+        for score, song, line in matches:
+            title = _jw_song_name(song)
+            key = _jw_normalize_match(title)
+            if not key or key in seen_titles:
+                continue
+            seen_titles.add(key)
+            results.append((score, title, line))
+            if len(results) >= 10:
+                break
+        if not results:
+            return await ctx.send(f"No lyric matches found for **{discord.utils.escape_markdown(phrase[:120])}**. Try a longer or more exact phrase.")
+        embed = discord.Embed(
+            title="🔎 Juice WRLD Lyric Search",
+            description=f"Found **{len(results)}** matching song(s) for: “{discord.utils.escape_markdown(phrase[:180])}”",
+            color=JUICE_COLOR,
         )
+        for i, (score, title, line) in enumerate(results, start=1):
+            snippet = discord.utils.escape_markdown((line or "Matching lyric text")[:180])
+            embed.add_field(name=f"{i}. {title[:240]}", value=f"{snippet}\n-# Match score: {score}%", inline=False)
+        embed.set_footer(text="Search covers the catalog returned by JuiceWRLDAPI; results depend on available lyric metadata.")
+        await ctx.send(embed=embed)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Lyric search failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The Juice WRLD catalog is unavailable right now. Please try lyric search again later.")
+
+
+@bot.command(name="jwcover")
+@commands.cooldown(1, 8, commands.BucketType.user)
+async def juicewrld_cover(ctx: commands.Context, *, query: str):
+    """Search community cover art and show the first matching image with links to more."""
+    try:
+        payload = await _jw_get_json_url("https://wrld.pure0.lol/api/covers/", params={"search": query})
+        images = payload.get("images", []) if isinstance(payload, dict) else []
+        urls, seen = [], set()
+        for image in images if isinstance(images, list) else []:
+            if isinstance(image, dict):
+                image = image.get("url") or image.get("image") or image.get("src")
+            if not isinstance(image, str) or not image.strip():
+                continue
+            image = image.strip().replace(" ", "%20")
+            if image.startswith("/"):
+                image = "https://wrld.pure0.lol" + image
+            if not image.startswith(("https://", "http://")):
+                continue
+            if image.lower() not in seen:
+                urls.append(image)
+                seen.add(image.lower())
+            if len(urls) >= 19:
+                break
+        if not urls:
+            return await ctx.send(f"No cover art found for **{discord.utils.escape_markdown(query[:100])}**. The cover service may also be unavailable.")
+        embed = discord.Embed(title=f"🎨 Cover art: {query[:180]}", description=f"Found **{len(urls)}** cover image(s).", color=JUICE_COLOR)
+        embed.set_image(url=urls[0])
+        if len(urls) > 1:
+            embed.add_field(name="More covers", value="\n".join(f"[{i}. Open cover]({url})" for i, url in enumerate(urls[1:10], start=2)), inline=False)
+        embed.set_footer(text="Source: WRLD cover API • Open links to view other results")
+        await ctx.send(embed=embed)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Cover lookup failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The cover-art service is unavailable right now. Please try again later.")
+
+
+@bot.command(name="jwfiles")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def juicewrld_files(ctx: commands.Context, *, query: str):
+    """Search JuiceWRLDAPI's file browser for audio files matching a song title."""
+    try:
+        await ctx.typing()
+        payload = await _juicewrld_api_get("/files/browse/", params={"search": query})
+        items = _juicewrld_items(payload)
+        files = _jw_audio_candidates(items, query)
+        if not files:
+            # Some API deployments have a browse endpoint that returns directory summaries;
+            # fall back to the flat listing but keep the same title/path filtering.
+            payload = await _juicewrld_api_get("/files/list-all/")
+            items = _juicewrld_items(payload)
+            files = _jw_audio_candidates(items, query)
+        if not files:
+            return await ctx.send(f"No matching audio files found for **{discord.utils.escape_markdown(query[:120])}**. A catalog entry does not guarantee an audio file is available.")
+        view = discord.ui.View(timeout=180)
+        view.add_item(JuiceWRLDFileSelect(files, ctx.author.id, query[:200]))
+        embed = discord.Embed(
+            title="📁 Juice WRLD File Search",
+            description=f"Found **{len(files)}** audio file(s) matching **{discord.utils.escape_markdown(query[:150])}**. Choose a file below to open download links.",
+            color=JUICE_COLOR,
+        )
+        embed.set_footer(text="Source: JuiceWRLDAPI file browser • Availability depends on the API listing")
+        await ctx.send(embed=embed, view=view)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] File search failed: {type(exc).__name__}: {exc}")
+        await ctx.send("The Juice WRLD file browser is unavailable right now. Please try again later.")
 
 
 @bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
