@@ -1355,6 +1355,11 @@ async def on_ready():
         print(f"Command sync failed: {type(error).__name__}: {error}")
 
     _load_juicewrld_state()
+    # One-time diagnostic: check whether the hosting runtime can access the
+    # website RSS feed before we wire it into group-buy updates.
+    if not getattr(bot, "_jw_rss_diagnostic_started", False):
+        bot._jw_rss_diagnostic_started = True
+        asyncio.create_task(_diagnose_juicewrld_rss_feed())
     if JUICEWRLD_CHANNEL_ID:
         if not juicewrld_tracker_task.is_running():
             juicewrld_tracker_task.start()
@@ -2540,6 +2545,57 @@ class JuiceWRLDSongView(discord.ui.View):
                 await self.message.edit(view=self)
             except (discord.HTTPException, discord.NotFound):
                 pass
+
+
+# Diagnostic for the site's published RSS feed. This deliberately does not
+# change ~jwgb behavior yet; first confirm that the bot host can read the feed.
+JUICEWRLD_RSS_FEED_URL = "https://juicewrld.io/feed.xml"
+
+
+async def _diagnose_juicewrld_rss_feed():
+    timeout = aiohttp.ClientTimeout(total=12)
+    headers = {
+        "User-Agent": "VaultBot/1.0 (+https://github.com/minjashyper/VaultBot; RSS feed check)",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(JUICEWRLD_RSS_FEED_URL, allow_redirects=True) as response:
+                content_type = response.headers.get("Content-Type", "unknown")
+                body = await response.text(errors="replace")
+                print(
+                    f"[JuiceWRLD] RSS feed diagnostic: HTTP {response.status}; "
+                    f"content-type={content_type}; bytes={len(body.encode('utf-8', errors='replace'))}."
+                )
+                if response.status != 200:
+                    print(f"[JuiceWRLD] RSS feed is not accessible from this host (HTTP {response.status}).")
+                    return
+                try:
+                    root = ET.fromstring(body)
+                except ET.ParseError as exc:
+                    print(f"[JuiceWRLD] RSS URL returned HTTP 200 but was not valid XML: {exc!r}")
+                    return
+                entries = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}]
+                group_buy_entries = []
+                for entry in entries:
+                    fields = []
+                    for node in entry.iter():
+                        if node.text and node.text.strip():
+                            fields.append(node.text.strip())
+                        for key, value in node.attrib.items():
+                            if key.lower() in {"href", "term"} and value:
+                                fields.append(value.strip())
+                    combined = " ".join(fields).casefold()
+                    if "group buy" in combined or "groupbuy" in combined or "group-buys" in combined:
+                        group_buy_entries.append(entry)
+                print(
+                    f"[JuiceWRLD] RSS feed accessible; parsed {len(entries)} feed entries, "
+                    f"{len(group_buy_entries)} mention group buys."
+                )
+    except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError) as exc:
+        print(f"[JuiceWRLD] RSS feed diagnostic failed: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        print(f"[JuiceWRLD] Unexpected RSS diagnostic error: {type(exc).__name__}: {exc}")
 
 
 # juicewrld.io group-buy archive. It is an informational archive; it does not
