@@ -556,16 +556,35 @@ async def play_next(ctx: commands.Context) -> None:
                     if previous and previous.requester == "Juice WRLD Radio"
                     else ""
                 )
-                track = await _fetch_random_jw_track(
-                    "Juice WRLD Radio", avoid_title=avoid_title
-                )
+                last_radio_error = None
+                track = None
+                # A transient API timeout should not permanently turn radio off.
+                # Each fetch already tries several candidate audio files; retry the
+                # catalog lookup too before declaring radio unavailable.
+                for radio_attempt in range(3):
+                    try:
+                        track = await _fetch_random_jw_track(
+                            "Juice WRLD Radio", avoid_title=avoid_title
+                        )
+                        break
+                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                        last_radio_error = exc
+                        print(
+                            f"[JuiceWRLD Radio] Fetch attempt {radio_attempt + 1}/3 failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        if radio_attempt < 2:
+                            await asyncio.sleep(2 * (radio_attempt + 1))
+                if track is None:
+                    raise last_radio_error or RuntimeError("No playable radio track was returned.")
             except Exception as exc:
                 jw_radio_active.discard(guild_id)
                 current_tracks.pop(guild_id, None)
                 print(f"[JuiceWRLD Radio] Could not fetch next track: {type(exc).__name__}: {exc}")
                 try:
                     await ctx.send(
-                        "📻 Juice WRLD Radio stopped because the API couldn't provide another playable track. "
+                        "📻 Juice WRLD Radio stopped after repeated API/download failures. "
+                        "Try `~jwradio` again in a minute. "
                         f"Details: {discord.utils.escape_markdown(str(exc))[:180]}"
                     )
                 except discord.HTTPException:
@@ -687,16 +706,35 @@ def _save_juicewrld_state() -> None:
 
 
 async def _juicewrld_api_get(path: str, params: Optional[dict] = None):
-    timeout = aiohttp.ClientTimeout(total=20)
+    """Call the Juice WRLD API with a longer timeout and transient-error retries."""
+    timeout = aiohttp.ClientTimeout(total=60, sock_connect=20, sock_read=40)
     headers = {"Accept": "application/json"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(
-            f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
-        ) as response:
-            response.raise_for_status()
-            return await response.json(content_type=None)
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(
+                    f"{JUICEWRLD_API_BASE}/{path.lstrip('/')}", params=params
+                ) as response:
+                    response.raise_for_status()
+                    return await response.json(content_type=None)
+        except aiohttp.ClientResponseError as exc:
+            # Retry server-side errors, but don't keep retrying invalid requests/auth failures.
+            if exc.status < 500:
+                raise
+            last_error = exc
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = exc
+
+        if attempt < 2:
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Juice WRLD API request failed without returning a response.")
 
 
 def _juicewrld_items(payload):
@@ -2401,7 +2439,7 @@ def _jw_is_beat_or_instrumental(path, item=None) -> bool:
 
 
 def _jw_is_fanmade_or_altered(path, item=None) -> bool:
-    """Filter obvious unofficial remixes, covers, mashups, and edited uploads.
+    """Filter mixes/remixes plus obvious unofficial covers, mashups, and edited uploads.
 
     The API does not reliably expose rights/official-status metadata, so this is
     deliberately a conservative filename, folder, and metadata heuristic.
@@ -2421,10 +2459,11 @@ def _jw_is_fanmade_or_altered(path, item=None) -> bool:
 
     # A folder explicitly dedicated to alternate/community edits is a strong signal.
     blocked_folders = {
-        "remix", "remixes", "fan remixes", "fanmade remixes", "fan-made remixes",
-        "mashup", "mashups", "covers", "cover versions", "edits", "fan edits",
-        "unofficial", "bootlegs", "bootleg", "ai covers", "ai generated",
-        "sped up", "slowed", "slowed reverb", "nightcore", "8d audio",
+        "mix", "mixes", "remix", "remixes", "remixs", "fan remixes",
+        "fanmade remixes", "fan-made remixes", "mashup", "mashups", "covers",
+        "cover versions", "edits", "fan edits", "unofficial", "bootlegs", "bootleg",
+        "ai covers", "ai generated", "sped up", "slowed", "slowed reverb",
+        "nightcore", "8d audio",
     }
     parts = [part.strip() for part in normalized_path.split("/") if part.strip()]
     if any(part in blocked_folders for part in parts[:-1]):
@@ -2432,7 +2471,10 @@ def _jw_is_fanmade_or_altered(path, item=None) -> bool:
 
     # Word-boundary patterns avoid matching incidental substrings in normal titles.
     altered_patterns = (
-        r"\bremix(?:ed)?\b", r"\b(?:fan[ -]?made|fanmade|unofficial)\b",
+        # Exclude any title/path/metadata explicitly labelled mix or remix,
+        # including plural and common misspelled forms.
+        r"\b(?:re)?mix(?:es|s|ed)?\b",
+        r"\b(?:fan[ -]?made|fanmade|unofficial)\b",
         r"\bmash[ -]?up\b", r"\bbootleg\b", r"\bcover(?: version)?\b",
         r"\b(?:sped[ -]?up|speed[ -]?up|slowed(?:[ -]?down)?|slowed[ -]?reverb)\b",
         r"\bnightcore\b", r"\b8d(?:[ -]?audio)?\b",
