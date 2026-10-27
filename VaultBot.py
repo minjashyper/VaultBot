@@ -2925,20 +2925,63 @@ async def juicewrld_group_buy(ctx: commands.Context, *, query: Optional[str] = N
             entries = _jw_gb_data(payload)
             if entries:
                 if query and query.strip():
-                    ranked = sorted((( _jw_groupbuy_score(query, item), item) for item in entries), key=lambda pair: pair[0], reverse=True)
-                    if not ranked or ranked[0][0] < 55:
-                        await ctx.send(f"No group-buy entry matching **{discord.utils.escape_markdown(query[:100])}** was found in the current API data.\nArchive: {JUICEWRLD_GROUP_BUYS_URL}")
+                    ranked = sorted(((_jw_groupbuy_score(query, item), item) for item in entries), key=lambda pair: pair[0], reverse=True)
+                    if ranked and ranked[0][0] >= 55:
+                        await ctx.send(embed=_jw_groupbuy_embed(ranked[0][1], latest=False))
                         return
-                    selected = ranked[0][1]
-                    await ctx.send(embed=_jw_groupbuy_embed(selected, latest=False))
+                    # API results can lag behind the public archive; search the saved
+                    # snapshot before reporting that a title does not exist.
+                    fallback_items = _load_juicewrld_group_buy_fallback()
+                    needle = _jw_normalize_match(query)
+                    matches = [item for item in fallback_items if needle and (
+                        needle in _jw_normalize_match(item.get("title"))
+                        or needle in _jw_normalize_match(item.get("text"))
+                    )]
+                    if matches:
+                        item = matches[0]
+                        embed = discord.Embed(
+                            title=f"🧃 Juice WRLD Group Buy: {item.get('title', 'Unknown')}"[:256],
+                            url=item.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+                            description=f"**Archive entry:** [{discord.utils.escape_markdown(str(item.get('title', 'Unknown')))}]({item.get('url') or JUICEWRLD_GROUP_BUYS_URL})\nHistorical group-buy information only; no seller or payment links are provided.\n\n⚠️ This result comes from the saved archive snapshot and may not include every recent change.",
+                            color=JUICE_COLOR,
+                        )
+                        embed.add_field(name="Goal", value=str(item.get("goal") or "Not listed"), inline=True)
+                        embed.add_field(name="Outcome", value=str(item.get("outcome") or "Not recorded"), inline=True)
+                        embed.add_field(name="Date", value=str(item.get("date") or "Not listed"), inline=True)
+                        embed.set_footer(text="Source: saved juicewrld.io archive snapshot")
+                        await ctx.send(embed=embed)
+                        return
+                    await ctx.send(f"No group-buy entry matching **{discord.utils.escape_markdown(query[:100])}** was found in the API or saved snapshot.\nArchive: {JUICEWRLD_GROUP_BUYS_URL}")
                     return
-                # Prefer the newest start date when provided; otherwise preserve the API's order.
+                # The API has been lagging the public archive. Compare its newest
+                # dated row with the newest saved snapshot entry before choosing.
                 dated = [(i, _jw_groupbuy_date(item), item) for i, item in enumerate(entries)]
                 if any(date for _, date, _ in dated):
                     dated.sort(key=lambda row: (row[1] is not None, row[1] or datetime.min, -row[0]), reverse=True)
                     selected = dated[0][2]
                 else:
                     selected = entries[0]
+                snapshot_items = _load_juicewrld_group_buy_fallback()
+                if snapshot_items:
+                    snapshot = snapshot_items[0]
+                    try:
+                        snapshot_date = datetime.strptime(str(snapshot.get("date", "")), "%b %d, %Y")
+                    except ValueError:
+                        snapshot_date = None
+                    api_date = _jw_groupbuy_date(selected)
+                    if snapshot_date and (api_date is None or snapshot_date > api_date):
+                        embed = discord.Embed(
+                            title=f"🧃 Latest Juice WRLD Group Buy: {snapshot.get('title', 'Unknown')}"[:256],
+                            url=snapshot.get("url") or JUICEWRLD_GROUP_BUYS_URL,
+                            description=f"**Archive entry:** [{discord.utils.escape_markdown(str(snapshot.get('title', 'Unknown')))}]({snapshot.get('url') or JUICEWRLD_GROUP_BUYS_URL})\nHistorical group-buy information only; no seller or payment links are provided.\n\n⚠️ The live API appears to be behind; this is the newest entry in the saved snapshot.",
+                            color=JUICE_COLOR,
+                        )
+                        embed.add_field(name="Goal", value=str(snapshot.get("goal") or "Not listed"), inline=True)
+                        embed.add_field(name="Outcome", value=str(snapshot.get("outcome") or "Not recorded"), inline=True)
+                        embed.add_field(name="Date", value=str(snapshot.get("date") or "Not listed"), inline=True)
+                        embed.set_footer(text="Source: saved juicewrld.io archive snapshot")
+                        await ctx.send(embed=embed)
+                        return
                 await ctx.send(embed=_jw_groupbuy_embed(selected, latest=True))
                 return
             print("[JuiceWRLD] Group-buy API returned no entries; trying the existing archive fallback.")
