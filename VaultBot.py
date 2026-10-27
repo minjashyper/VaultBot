@@ -3430,7 +3430,7 @@ def _jw_parse_duration(song: dict) -> Optional[int]:
 
 
 async def _download_juicewrld_track(song: dict, requester: str) -> Track:
-    """Download one API-linked audio file into VaultBot's normal temp-track format."""
+    """Download an API-linked audio file with compressed-first retries."""
     raw_path = song.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ValueError("This catalog result does not have a downloadable audio path.")
@@ -3439,65 +3439,85 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
     if remote_path.startswith(("http://", "https://")) or ".." in remote_path.split("/"):
         raise ValueError("The API returned an invalid audio path.")
 
-    suffix = Path(remote_path).suffix.lower()
-    if suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac", ".aac", ".mp4"}:
-        suffix = ".mp3"
+    original_suffix = Path(remote_path).suffix.lower()
+    if original_suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac", ".aac", ".mp4"}:
+        original_suffix = ".mp3"
 
-    folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
-    local_path = folder / f"juicewrld{suffix}"
-    url = f"{JUICEWRLD_API_BASE}/files/download/"
-    params = {"path": remote_path}
+    # Try the API's smaller compressed MP3 endpoint first (large WAV files can
+    # be slow to serve), then fall back to the original file endpoint.
+    attempts = [
+        ("files/download-compressed/", {"path": remote_path, "bitrate": "160k"}, ".mp3"),
+        ("files/download/", {"path": remote_path}, original_suffix),
+    ]
     headers = {"Accept": "audio/*, application/octet-stream"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
 
-    # Keep a ceiling so a malformed API result cannot fill the host's disk.
     max_bytes = 200 * 1024 * 1024
-    total_bytes = 0
-    timeout = aiohttp.ClientTimeout(total=300, sock_connect=20, sock_read=60)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url, params=params) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("Content-Type", "").lower()
-                if "application/json" in content_type or "text/html" in content_type:
-                    detail = (await response.text())[:180]
-                    raise ValueError(f"The API did not return audio data. {detail}")
-                with local_path.open("wb") as output:
-                    async for chunk in response.content.iter_chunked(128 * 1024):
-                        if not chunk:
-                            continue
-                        total_bytes += len(chunk)
-                        if total_bytes > max_bytes:
-                            raise ValueError("The audio file exceeds VaultBot's 200 MB limit.")
-                        output.write(chunk)
-        if total_bytes == 0:
-            raise ValueError("The API returned an empty audio file.")
-    except Exception:
-        shutil.rmtree(folder, ignore_errors=True)
-        raise
+    last_error = None
+    for endpoint, params, suffix in attempts:
+        for attempt in range(3):
+            folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
+            local_path = folder / f"juicewrld{suffix}"
+            total_bytes = 0
+            # Host connection can take longer than the default; retry transient
+            # connection/read failures before falling back to the original file.
+            timeout = aiohttp.ClientTimeout(total=360, sock_connect=60, sock_read=90)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get(
+                        f"{JUICEWRLD_API_BASE}/{endpoint}", params=params
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        if "application/json" in content_type or "text/html" in content_type:
+                            detail = (await response.text())[:180]
+                            raise ValueError(f"The API did not return audio data. {detail}")
+                        with local_path.open("wb") as output:
+                            async for chunk in response.content.iter_chunked(128 * 1024):
+                                if not chunk:
+                                    continue
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    raise ValueError("The audio file exceeds VaultBot's 200 MB limit.")
+                                output.write(chunk)
+                if total_bytes == 0:
+                    raise ValueError("The API returned an empty audio file.")
 
-    title = str(song.get("name") or song.get("title") or Path(remote_path).stem or "Juice WRLD track")
-    song_id = song.get("id")
-    webpage_url = (
-        f"{JUICEWRLD_API_BASE}/songs/{int(song_id)}/"
-        if song_id is not None and str(song_id).isdigit()
-        else "https://juicewrldapi.com/"
-    )
-    path_text = str(local_path)
-    TEMP_FILES.add(path_text)
-    return Track(
-        title=title,
-        webpage_url=webpage_url,
-        requester=requester,
-        local_path=path_text,
-        duration=_jw_parse_duration(song),
-        source_name="Juice WRLD API",
-    )
+                title = str(song.get("name") or song.get("title") or Path(remote_path).stem or "Juice WRLD track")
+                song_id = song.get("id")
+                webpage_url = (
+                    f"{JUICEWRLD_API_BASE}/songs/{int(song_id)}/"
+                    if song_id is not None and str(song_id).isdigit()
+                    else "https://juicewrldapi.com/"
+                )
+                path_text = str(local_path)
+                TEMP_FILES.add(path_text)
+                return Track(
+                    title=title,
+                    webpage_url=webpage_url,
+                    requester=requester,
+                    local_path=path_text,
+                    duration=_jw_parse_duration(song),
+                    source_name="Juice WRLD API",
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = exc
+                shutil.rmtree(folder, ignore_errors=True)
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            except Exception as exc:
+                shutil.rmtree(folder, ignore_errors=True)
+                # Invalid/non-audio response: move to the original endpoint.
+                last_error = exc
+                break
+    if last_error:
+        raise last_error
+    raise ValueError("The Juice WRLD API could not provide playable audio.")
 
 
 async def _fetch_random_jw_track(requester: str) -> Track:
-    """Fetch a random playable audio file from the API's public file listing."""
+    """Try several random API-listed files so one broken download won't kill radio."""
     payload = await _juicewrld_api_get("/files/list-all/")
     entries = _juicewrld_items(payload)
     audio_files = _jw_audio_candidates(entries, query="", limit=10000)
@@ -3507,11 +3527,23 @@ async def _fetch_random_jw_track(requester: str) -> Track:
         audio_files = _jw_audio_candidates(entries, query="", limit=10000)
     if not audio_files:
         raise ValueError("The Juice WRLD API did not list any playable audio files.")
-    path, file_info = random.choice(audio_files)
-    selected = dict(file_info) if isinstance(file_info, dict) else {}
-    selected["path"] = path
-    selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
-    return await _download_juicewrld_track(selected, requester)
+
+    random.shuffle(audio_files)
+    errors = []
+    # Don't let a single dead/slow host path prevent radio from starting.
+    for path, file_info in audio_files[:8]:
+        selected = dict(file_info) if isinstance(file_info, dict) else {}
+        selected["path"] = path
+        selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+        try:
+            return await _download_juicewrld_track(selected, requester)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            errors.append(f"{Path(path).name}: {type(exc).__name__}")
+            print(f"[JuiceWRLD Radio] Skipping unavailable file {path!r}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(
+        "The API listed files, but the first 8 random audio downloads failed. "
+        + "; ".join(errors[:4])
+    )
 
 
 @bot.command(name="jwradio")
