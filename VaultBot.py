@@ -246,6 +246,10 @@ loop_modes: dict[int, str] = {}  # off, song, queue
 volumes: dict[int, float] = {}
 now_playing_messages: dict[int, discord.Message] = {}
 queue_locks: dict[int, asyncio.Lock] = {}
+# Per-server radio state. While active, manual play commands are blocked so
+# the continuous Juice WRLD radio owns the shared music session.
+jw_radio_active: set[int] = set()
+jw_radio_starting: set[int] = set()
 TEMP_FILES: set[str] = set()
 
 
@@ -528,13 +532,45 @@ async def play_next(ctx: commands.Context) -> None:
             current_tracks.pop(guild_id, None)
             return
         previous = current_tracks.get(guild_id)
-        mode = loop_modes.get(guild_id, "off")
+        # Radio owns playback while active, so ordinary loop modes cannot
+        # prevent the next random track from being selected.
+        mode = "off" if guild_id in jw_radio_active else loop_modes.get(guild_id, "off")
         if previous and mode == "song":
             get_queue(guild_id).appendleft(previous)
         elif previous and mode == "queue":
             get_queue(guild_id).append(previous)
         elif previous:
             clean_temp_file(previous.local_path)
+
+        if not get_queue(guild_id) and guild_id in jw_radio_active:
+            # Radio fetches the next random track only when the shared queue is
+            # empty. The starting guard prevents a duplicate fetch if a song
+            # ends while the initial radio command is downloading its seed.
+            if guild_id in jw_radio_starting:
+                current_tracks.pop(guild_id, None)
+                return
+            jw_radio_starting.add(guild_id)
+            try:
+                track = await _fetch_random_jw_track("Juice WRLD Radio")
+            except Exception as exc:
+                jw_radio_active.discard(guild_id)
+                current_tracks.pop(guild_id, None)
+                print(f"[JuiceWRLD Radio] Could not fetch next track: {type(exc).__name__}: {exc}")
+                try:
+                    await ctx.send(
+                        "📻 Juice WRLD Radio stopped because the API couldn't provide another playable track. "
+                        f"Details: {discord.utils.escape_markdown(str(exc))[:180]}"
+                    )
+                except discord.HTTPException:
+                    pass
+                return
+            finally:
+                jw_radio_starting.discard(guild_id)
+            if guild_id not in jw_radio_active:
+                clean_temp_file(track.local_path)
+                current_tracks.pop(guild_id, None)
+                return
+            get_queue(guild_id).append(track)
 
         if not get_queue(guild_id):
             current_tracks.pop(guild_id, None)
@@ -1000,14 +1036,14 @@ HELP_PAGES: list[dict] = [
     },
     {
         "key": "juice",
-        "aliases": ("jw", "jwplay", "jwsong", "tracker", "juicewrld"),
+        "aliases": ("jw", "jwplay", "jwradio", "jwsong", "tracker", "juicewrld"),
         "emoji": "🧃",
         "title": "Juice WRLD Tools",
         "summary": "Catalog search, shared-queue playback, and tracker updates",
         "color": JUICE_COLOR,
         "description": (
-            "Catalog tools powered by the Juice WRLD API. `~jwplay` queues available "
-            "catalog audio in the same per-server player and queue as `~play`."
+            "Catalog tools powered by the Juice WRLD API. `~jwplay` queues tracks in the shared player; "
+            "`~jwradio` continuously plays random tracks and blocks manual play commands until disabled."
         ),
         "fields": [
             (
@@ -1015,6 +1051,11 @@ HELP_PAGES: list[dict] = [
                 "Searches for a Juice WRLD catalog match and queues its available audio in the same queue as "
                 f"`{PREFIX}play`. It will not interrupt a song already playing.\n"
                 f"Example: `{PREFIX}jwplay lucid dreams`",
+            ),
+            (
+                f"`{PREFIX}jwradio` / `{PREFIX}jwradio off`",
+                "Continuously queues random Juice WRLD tracks. While radio is active, `~play` and `~jwplay` "
+                "are blocked; disable radio with `~jwradio off` or use `~stop` / `~leave` to stop/disconnect.",
             ),
             (
                 f"`{PREFIX}jwsong <search>`",
@@ -1946,6 +1987,11 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     """Play a song name, supported URL, or attached MP3/WAV/Opus file."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
+    if ctx.guild.id in jw_radio_active:
+        return await ctx.send(
+            f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
+            "before using `~play`, or use `~stop` / `~leave` to stop the radio and disconnect me."
+        )
     diag(f"~play received: {query[:80]!r}")
     if not query.strip() and not ctx.message.attachments:
         return await ctx.send(
@@ -2063,8 +2109,11 @@ async def skip_command(ctx: commands.Context):
 async def stop_command(ctx: commands.Context):
     if not ctx.guild:
         return
+    guild_id = ctx.guild.id
+    jw_radio_active.discard(guild_id)
+    jw_radio_starting.discard(guild_id)
     voice = ctx.guild.voice_client
-    get_queue(ctx.guild.id).clear()
+    get_queue(guild_id).clear()
     loop_modes[ctx.guild.id] = "off"
     current = current_tracks.pop(ctx.guild.id, None)
     if current:
@@ -2134,6 +2183,8 @@ async def leave_command(ctx: commands.Context):
     if not ctx.guild or not ctx.guild.voice_client:
         return await ctx.send("I'm not connected to a voice channel.")
     guild_id = ctx.guild.id
+    jw_radio_active.discard(guild_id)
+    jw_radio_starting.discard(guild_id)
     voice = ctx.guild.voice_client
     get_queue(guild_id).clear()
     loop_modes[guild_id] = "off"
@@ -3445,11 +3496,105 @@ async def _download_juicewrld_track(song: dict, requester: str) -> Track:
     )
 
 
+async def _fetch_random_jw_track(requester: str) -> Track:
+    """Fetch a random playable audio file from the API's public file listing."""
+    payload = await _juicewrld_api_get("/files/list-all/")
+    entries = _juicewrld_items(payload)
+    audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+    if not audio_files:
+        payload = await _juicewrld_api_get("/files/browse/")
+        entries = _juicewrld_items(payload)
+        audio_files = _jw_audio_candidates(entries, query="", limit=10000)
+    if not audio_files:
+        raise ValueError("The Juice WRLD API did not list any playable audio files.")
+    path, file_info = random.choice(audio_files)
+    selected = dict(file_info) if isinstance(file_info, dict) else {}
+    selected["path"] = path
+    selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+    return await _download_juicewrld_track(selected, requester)
+
+
+@bot.command(name="jwradio")
+async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
+    """Continuously play random Juice WRLD tracks until disabled or disconnected."""
+    if not ctx.guild:
+        return await ctx.send("Use this command inside a server.")
+
+    guild_id = ctx.guild.id
+    action = action.casefold().strip()
+    if action in {"off", "stop", "disable", "disabled"}:
+        was_active = guild_id in jw_radio_active or guild_id in jw_radio_starting
+        jw_radio_active.discard(guild_id)
+        jw_radio_starting.discard(guild_id)
+        # Any queued radio track is no longer needed; the current song may
+        # finish normally. ~stop or ~leave ends playback/disconnects immediately.
+        while get_queue(guild_id):
+            queued_track = get_queue(guild_id).popleft()
+            clean_temp_file(queued_track.local_path)
+        if not was_active:
+            return await ctx.send("Juice WRLD Radio isn't active in this server.")
+        return await ctx.send(
+            "📻 **Juice WRLD Radio disabled.** The current song can finish, but no more random tracks will be added. "
+            "Use `~stop` to stop playback or `~leave` to disconnect immediately."
+        )
+
+    if action not in {"on", "start", ""}:
+        return await ctx.send(f"Usage: `{PREFIX}jwradio` to start or `{PREFIX}jwradio off` to disable it.")
+    if guild_id in jw_radio_active:
+        return await ctx.send("📻 Juice WRLD Radio is already active. Use `~jwradio off` to disable it.")
+
+    try:
+        await ensure_voice(ctx)
+    except Exception as exc:
+        return await ctx.send(str(exc))
+
+    # Activate before fetching so ~play and ~jwplay cannot race the radio start.
+    jw_radio_active.add(guild_id)
+    jw_radio_starting.add(guild_id)
+    loop_modes[guild_id] = "off"
+    # Take ownership of the queue immediately. The current track is allowed
+    # to finish, but previously queued tracks should not play ahead of radio.
+    while get_queue(guild_id):
+        queued_track = get_queue(guild_id).popleft()
+        clean_temp_file(queued_track.local_path)
+    await ctx.typing()
+    try:
+        track = await _fetch_random_jw_track("Juice WRLD Radio")
+    except Exception as exc:
+        jw_radio_active.discard(guild_id)
+        jw_radio_starting.discard(guild_id)
+        print(f"[JuiceWRLD Radio] Could not start: {type(exc).__name__}: {exc}")
+        return await ctx.send(
+            "❌ I couldn't start Juice WRLD Radio because the API didn't provide playable audio. "
+            f"Details: {discord.utils.escape_markdown(str(exc))[:180]}"
+        )
+    finally:
+        jw_radio_starting.discard(guild_id)
+
+    # If someone disabled radio while the initial file was downloading, don't
+    # enqueue or start the track after the disable command.
+    if guild_id not in jw_radio_active:
+        clean_temp_file(track.local_path)
+        return await ctx.send("Juice WRLD Radio was disabled before it could start.")
+
+    # The current track is not interrupted; this random track starts next.
+    await queue_track(ctx, track)
+    await ctx.send(
+        "📻 **Juice WRLD Radio is now active!** I'll keep adding random tracks when each song ends. "
+        "`~play` and `~jwplay` are blocked until you use `~jwradio off`."
+    )
+
+
 @bot.command(name="jwplay", aliases=["jwp"])
 async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
     """Search the Juice WRLD API and queue its audio in the shared music player."""
     if not ctx.guild:
         return await ctx.send("Use this command inside a server.")
+    if ctx.guild.id in jw_radio_active:
+        return await ctx.send(
+            f"📻 **Juice WRLD Radio is active** in this server. Disable it with `~jwradio off` "
+            "before using `~jwplay` / `~jwp`, or use `~stop` / `~leave` to stop the radio and disconnect me."
+        )
     # With no argument, choose a random playable file. Supplying a title still
     # searches for that specific song; the `random` keyword remains optional.
     wants_random = not query.strip() or query.strip().casefold() == "random"
@@ -7443,7 +7588,7 @@ def _vault_control_embed(page: str, guild: Optional[discord.Guild]) -> discord.E
         modules = [
             ('🎮 GAME RADAR', '`/freestuff` • `/patchnotes`', 'Free offers, Steam game announcements, and supported game feeds.'),
             ('🎵 MUSIC ENGINE', '`~play` • `~queue` • `~nowplaying`', 'Voice playback and queue controls.'),
-            ('🖤 JUICE WRLD', '`~jwplay` • `~jwsong`', 'Queues available catalog audio in the shared music queue and searches song metadata.'),
+            ('🖤 JUICE WRLD', '`~jwplay` • `~jwradio` • `~jwsong`', 'Queues catalog audio, plays continuous random radio, and searches song metadata.'),
             ('🛡️ MODERATION', '`~ban` • `~timeout` • `~clear`', 'Server moderation tools, subject to permissions.'),
         ]
         for name, commands_text, description in modules:
