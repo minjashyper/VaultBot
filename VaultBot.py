@@ -3813,28 +3813,57 @@ def _load_jw_radio_catalog_disk_cache() -> None:
 
 
 async def _refresh_jw_radio_catalog(progress_callback=None) -> list[tuple[str, dict]]:
-    """Fetch and persist the playable-file list using short timeouts."""
+    """Fetch and persist the playable-file list with retry windows suited to the large API listing."""
     global _jw_radio_catalog_cache, _jw_radio_catalog_cache_at
     async with _jw_radio_catalog_lock:
         # Another concurrent caller may have refreshed it while this task waited.
         if _jw_radio_catalog_cache and time.time() - _jw_radio_catalog_cache_at < _JW_RADIO_CATALOG_TTL_SECONDS:
             return _jw_radio_catalog_cache
+
         last_error = None
         audio_files = []
-        for endpoint in ("/files/list-all/", "/files/browse/"):
+        # /files/list-all/ can be a very large response, so a 15-second timeout
+        # was too aggressive and caused radio to fail before receiving any rows.
+        # The browse endpoint remains a quicker fallback if the flat listing stalls.
+        endpoints = (
+            ("/files/list-all/", 55, 2),
+            ("/files/browse/", 30, 2),
+        )
+        for endpoint, timeout_seconds, retries in endpoints:
             try:
-                payload = await _juicewrld_api_get(endpoint, timeout_seconds=15, retries=1)
+                if progress_callback is not None:
+                    try:
+                        await progress_callback(
+                            "📡 Loading Juice WRLD catalog…",
+                            f"Requesting `{endpoint}` (up to {retries} attempts, {timeout_seconds}s per attempt). The full catalog can take longer than a normal API lookup.",
+                        )
+                    except Exception:
+                        pass
+                payload = await _juicewrld_api_get(
+                    endpoint, timeout_seconds=timeout_seconds, retries=retries
+                )
                 entries = _juicewrld_items(payload)
                 audio_files = _jw_audio_candidates(entries, query="", limit=10000)
                 if audio_files:
+                    print(f"[JuiceWRLD Radio] Catalog loaded from {endpoint}: {len(audio_files)} playable candidate(s).")
                     break
+                print(f"[JuiceWRLD Radio] Catalog endpoint {endpoint} responded but contained no playable audio candidates.")
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError) as exc:
                 last_error = exc
-                print(f"[JuiceWRLD Radio] Fast catalog request {endpoint} failed: {type(exc).__name__}: {exc}")
+                print(f"[JuiceWRLD Radio] Catalog request {endpoint} failed: {type(exc).__name__}: {exc}")
+
         if not audio_files:
+            # Keep and use an in-memory stale cache if one exists; never throw away
+            # a previously successful catalog merely because the refresh timed out.
+            if _jw_radio_catalog_cache:
+                print(f"[JuiceWRLD Radio] Refresh failed; reusing {len(_jw_radio_catalog_cache)} cached candidate(s).")
+                return _jw_radio_catalog_cache
             if last_error:
-                raise last_error
-            raise ValueError("The Juice WRLD API did not list any playable audio files.")
+                raise RuntimeError(
+                    "The catalog endpoints timed out or failed after retries. "
+                    "The API may be slow or temporarily unavailable; try `~jwradio` again shortly."
+                ) from last_error
+            raise ValueError("The Juice WRLD API returned no playable audio files from its catalog endpoints.")
 
         now = time.time()
         _jw_radio_catalog_cache = audio_files
@@ -3850,7 +3879,7 @@ async def _refresh_jw_radio_catalog(progress_callback=None) -> list[tuple[str, d
             )
             tmp_path.write_text(json.dumps(cache_payload, ensure_ascii=False), encoding="utf-8")
             tmp_path.replace(JUICEWRLD_CATALOG_CACHE_FILE)
-            print(f"[JuiceWRLD Radio] Cached {len(audio_files)} playable audio file(s).")
+            print(f"[JuiceWRLD Radio] Cached {len(audio_files)} playable audio file(s) at {JUICEWRLD_CATALOG_CACHE_FILE}.")
         except (OSError, TypeError, ValueError) as exc:
             print(f"[JuiceWRLD Radio] Could not save catalog cache: {type(exc).__name__}: {exc}")
         return audio_files
@@ -4060,7 +4089,7 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
         print(f"[JuiceWRLD Radio] Could not start: {type(exc).__name__}: {exc}")
         return await _set_music_status(
             ctx, status_message, "❌ Couldn't start Juice WRLD Radio",
-            "The API didn't provide playable audio. "
+            "The catalog could not be loaded or no playable file was returned. The API may be slow or temporarily unavailable. "
             f"Details: {discord.utils.escape_markdown(str(exc))[:180]}",
             color=discord.Color.red().value,
         )
