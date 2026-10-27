@@ -2674,16 +2674,18 @@ async def server_widget(interaction: discord.Interaction):
 
     embed.set_footer(text="VAULTBOT SYSTEMS • SERVER WIDGET")
 
-    view = discord.ui.View(timeout=120)
-    if widget.instant_invite:
-        view.add_item(discord.ui.Button(
-            label="Join Server",
-            emoji="🔗",
-            style=discord.ButtonStyle.link,
-            url=widget.instant_invite,
-        ))
+    # Use the server invite supplied by the server owner. The Widget object
+    # in discord.py does not expose an ``instant_invite`` attribute.
+    invite_url = "https://discord.gg/qd7HsamzBa"
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label="Join Server",
+        emoji="🔗",
+        style=discord.ButtonStyle.link,
+        url=invite_url,
+    ))
 
-    await interaction.followup.send(embed=embed, view=view if view.children else None)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(
@@ -6700,3 +6702,4 @@ if not shutil.which("ffmpeg"):
     print("WARNING: ffmpeg executable not found. Voice playback will fail until FFmpeg is available.")
 
 bot.run(TOKEN)
+
