@@ -2748,7 +2748,8 @@ def _juicewrld_group_buy_from_row(row):
 
 
 async def _fetch_juicewrld_group_buys():
-    timeout = aiohttp.ClientTimeout(total=18)
+    # Keep a live lookup quick: Cloudflare may reject non-browser requests.
+    timeout = aiohttp.ClientTimeout(total=8)
     headers = {
         "User-Agent": "VaultBot/1.0 (Discord archive lookup)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -2794,7 +2795,13 @@ async def _fetch_juicewrld_group_buys():
     return items
 
 
-JUICEWRLD_GROUP_BUY_API_URL = "https://wrld.pure0.lol/api/groupbuys"
+# The default WRLD-bot endpoint can lag the public archive. It can be overridden
+# by the host if a maintained, current group-buy JSON endpoint becomes available.
+JUICEWRLD_GROUP_BUY_API_URL = os.getenv(
+    "JUICEWRLD_GROUP_BUY_API_URL",
+    "https://wrld.pure0.lol/api/groupbuys",
+).strip()
+_JWGB_LIVE_RETRY_AT = 0.0
 
 
 async def _jw_get_json_url(url: str, params: Optional[dict] = None):
@@ -2854,7 +2861,7 @@ def _jw_groupbuy_date(entry: dict):
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         pass
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%d %b %Y"):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%m/%d/%Y", "%d %b %Y"):
         try:
             return datetime.strptime(raw, fmt)
         except ValueError:
@@ -2919,7 +2926,63 @@ def _jw_groupbuy_embed(entry: dict, *, latest: bool, stale: bool = False) -> dis
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def juicewrld_group_buy(ctx: commands.Context, *, query: Optional[str] = None):
     """Show the newest group buy, or search the group-buy archive by title."""
+    global _JWGB_LIVE_RETRY_AT
     try:
+        # First try the public archive itself. The JSON mirror below has been
+        # observed to lag the public page by months. Back off for two minutes
+        # after each attempt so a Cloudflare 403 does not make every command slow.
+        live_items = None
+        if time.monotonic() >= _JWGB_LIVE_RETRY_AT:
+            try:
+                live_items = await _fetch_juicewrld_group_buys()
+                _JWGB_LIVE_RETRY_AT = time.monotonic() + 120
+                if live_items and len(live_items) < 3:
+                    # A partial page or changed layout isn't reliable enough to
+                    # override a more complete cached/API result.
+                    print(f"[JuiceWRLD] Live group-buy page returned only {len(live_items)} parsed item(s); checking fallback sources.")
+                    live_items = None
+            except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError, ValueError, TypeError) as exc:
+                _JWGB_LIVE_RETRY_AT = time.monotonic() + 120
+                print(f"[JuiceWRLD] Live group-buy archive unavailable; trying JSON mirror/cache: {type(exc).__name__}: {exc}")
+
+        if live_items:
+            selected = None
+            if query and query.strip():
+                needle = _jw_normalize_match(query)
+                live_matches = [item for item in live_items if needle and (
+                    needle in _jw_normalize_match(item.get("title"))
+                    or needle in _jw_normalize_match(item.get("text"))
+                )]
+                if live_matches:
+                    selected = live_matches[0]
+            else:
+                # The archive is newest-first, but prefer an explicit parsed date
+                # when available so this remains correct if row order changes.
+                selected = max(
+                    enumerate(live_items),
+                    key=lambda pair: (_jw_groupbuy_date(pair[1]) is not None,
+                                      _jw_groupbuy_date(pair[1]) or datetime.min,
+                                      -pair[0]),
+                )[1]
+            if selected is not None:
+                title = str(selected.get("title") or "Unknown")
+                item_url = selected.get("url") or JUICEWRLD_GROUP_BUYS_URL
+                embed = discord.Embed(
+                    title=f"🧃 {'Latest ' if not query else ''}Juice WRLD Group Buy: {title}"[:256],
+                    url=item_url,
+                    description=(
+                        f"**Archive entry:** [{discord.utils.escape_markdown(title[:180])}]({item_url})\n"
+                        "Historical group-buy information only; no seller or payment links are provided."
+                    ),
+                    color=JUICE_COLOR,
+                )
+                embed.add_field(name="Goal / Price", value=str(selected.get("goal") or "Not listed")[:1024], inline=True)
+                embed.add_field(name="Outcome", value=str(selected.get("outcome") or "Not recorded")[:1024], inline=True)
+                embed.add_field(name="Date", value=str(selected.get("date") or "Not listed")[:1024], inline=True)
+                embed.set_footer(text="Source: live juicewrld.io archive • Historical information only")
+                await ctx.send(embed=embed)
+                return
+
         try:
             payload = await _jw_get_json_url(JUICEWRLD_GROUP_BUY_API_URL)
             entries = _jw_gb_data(payload)
