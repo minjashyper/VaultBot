@@ -3696,14 +3696,13 @@ async def _download_juicewrld_track(
         original_suffix = ".mp3"
 
     # Try the API's smaller compressed MP3 endpoint first (large WAV files can
-    # be slow to serve), then fall back to the original file endpoint.
+    # be slow to serve), then ALWAYS fall back to the documented original-file
+    # stream endpoint. The API may reject transcoding with HTTP 406 for files
+    # that it can still serve normally; radio must not give up on those tracks.
     attempts = [
         ("files/download-compressed/", {"path": remote_path, "bitrate": "160k"}, ".mp3"),
+        ("files/download/", {"path": remote_path}, original_suffix),
     ]
-    # Manual song requests keep their robust original-file fallback. Radio uses
-    # compressed MP3 only so one dead catalog entry cannot stall the whole queue.
-    if not radio_fast:
-        attempts.append(("files/download/", {"path": remote_path}, original_suffix))
     headers = {"Accept": "audio/*, application/octet-stream"}
     if JUICEWRLD_API_KEY:
         headers["X-API-Key"] = JUICEWRLD_API_KEY
@@ -3763,13 +3762,21 @@ async def _download_juicewrld_track(
                 )
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 last_error = exc
+                print(
+                    f"[JuiceWRLD Audio] Endpoint {endpoint} failed for {remote_path!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
                 shutil.rmtree(folder, ignore_errors=True)
                 if attempt < endpoint_attempts - 1:
                     await asyncio.sleep(1.5 * (attempt + 1))
             except Exception as exc:
                 shutil.rmtree(folder, ignore_errors=True)
-                # Invalid/non-audio response: move to the original endpoint.
+                # Invalid/non-audio response: move on to the next endpoint.
                 last_error = exc
+                print(
+                    f"[JuiceWRLD Audio] Endpoint {endpoint} returned unusable data "
+                    f"for {remote_path!r}: {type(exc).__name__}: {exc}"
+                )
                 break
     if last_error:
         raise last_error
@@ -3989,11 +3996,13 @@ async def _fetch_random_jw_track(
             )
             return track
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
-            errors.append(f"{Path(path).name}: {type(exc).__name__}")
+            status = getattr(exc, "status", None)
+            error_label = f"{type(exc).__name__} HTTP {status}" if status else type(exc).__name__
+            errors.append(f"{Path(path).name}: {error_label}")
             print(f"[JuiceWRLD Radio] Skipping unavailable file {path!r}: {type(exc).__name__}: {exc}")
     raise RuntimeError(
-        "The API listed files, but the first 5 random compressed-audio downloads failed. "
-        + "; ".join(errors[:4])
+        f"The API listed files, but all {len(candidates)} random candidates failed on the "
+        "compressed and original audio endpoints. " + "; ".join(errors[:5])
     )
 
 
