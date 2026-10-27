@@ -154,7 +154,13 @@ _yt_clients = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") 
 if _yt_clients:
     YTDL_OPTIONS["extractor_args"] = {"youtube": {"player_client": _yt_clients}}
 
-FFMPEG_OPTIONS = {"options": "-vn -threads 1"}
+# Normalize audio timing and send a short silent pre-roll before the first audible
+# samples. This gives the Discord voice connection/Opus encoder a moment to settle,
+# which can help prevent the first instant of a track sounding rushed or garbled.
+# Audio is still decoded to discord.py's standard 48 kHz stereo PCM format.
+FFMPEG_OPTIONS = {
+    "options": "-vn -threads 1 -af aresample=48000:async=1:first_pts=0,adelay=300|300"
+}
 
 
 # This build intentionally does not read or create YouTube cookie files.
@@ -309,6 +315,28 @@ def build_now_playing_embed(track: Track, loop_mode: Optional[str] = None) -> di
     return embed
 
 
+async def _set_music_status(
+    ctx: commands.Context,
+    message: Optional[discord.Message],
+    title: str,
+    description: str,
+    *,
+    color: int = BRAND_COLOR,
+) -> None:
+    """Edit the instant music-command acknowledgement instead of leaving users waiting."""
+    embed = discord.Embed(title=title, description=description[:4000], color=color)
+    if message is not None:
+        try:
+            await message.edit(embed=embed)
+            return
+        except (discord.HTTPException, discord.NotFound):
+            pass
+    try:
+        await ctx.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
 # =============================================================================
 # 7. MUSIC ENGINE
 # =============================================================================
@@ -406,9 +434,16 @@ async def _fallback_search_variants(query: str) -> list:
     return out
 
 
-async def extract_track(query: str, requester: str) -> Track:
-    """Find and download one playable audio track with one yt-dlp extraction pass."""
-    def _extract(query: str):
+async def extract_track(query: str, requester: str, on_found=None) -> Track:
+    """Find and download one playable audio track with one yt-dlp extraction pass.
+
+    When provided, on_found(title) is called as soon as yt-dlp resolves a result
+    and begins downloading it, so the Discord status embed can update before the
+    full audio file finishes downloading.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _extract(query: str, notify_found=None):
         folder = tempfile.mkdtemp(prefix="vaultbot_audio_")
         options = dict(YTDL_OPTIONS)
         options.update({
@@ -418,6 +453,27 @@ async def extract_track(query: str, requester: str) -> Track:
             "playlist_items": "1",
             "skip_download": False,
         })
+        found_notified = False
+
+        def progress_hook(progress):
+            nonlocal found_notified
+            if found_notified or progress.get("status") != "downloading" or notify_found is None:
+                return
+            info = progress.get("info_dict") or {}
+            title = str(info.get("title") or "").strip()
+            if not title:
+                return
+            found_notified = True
+            try:
+                # Wait for the embed edit to finish before continuing download,
+                # preventing a late 'Found' update from overwriting the queued state.
+                future = asyncio.run_coroutine_threadsafe(notify_found(title), loop)
+                future.result(timeout=10)
+            except Exception as hook_exc:
+                print(f"[music status] Could not update found-song embed: {hook_exc}", flush=True)
+
+        if on_found is not None:
+            options["progress_hooks"] = list(options.get("progress_hooks") or []) + [progress_hook]
 
         try:
             diag("yt-dlp: starting one-pass search/extraction/download")
@@ -477,7 +533,7 @@ async def extract_track(query: str, requester: str) -> Track:
 
     async with _YTDL_SEMAPHORE:
         try:
-            data = await asyncio.to_thread(_extract, query)
+            data = await asyncio.to_thread(_extract, query, on_found)
         except Exception as exc:
             if not _is_signin_error(str(exc)):
                 raise
@@ -494,7 +550,7 @@ async def extract_track(query: str, requester: str) -> Track:
                 if not sc_url:
                     continue
                 try:
-                    data = await asyncio.to_thread(_extract, sc_url)
+                    data = await asyncio.to_thread(_extract, sc_url, on_found)
                     break
                 except Exception as sc_exc:
                     print(f"[fallback] SoundCloud download failed: {sc_exc}", flush=True)
@@ -652,14 +708,31 @@ async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
     return await ctx.author.voice.channel.connect()
 
 
-async def queue_track(ctx: commands.Context, track: Track) -> None:
+async def queue_track(
+    ctx: commands.Context,
+    track: Track,
+    *,
+    status_message: Optional[discord.Message] = None,
+) -> None:
     guild_id = ctx.guild.id
     get_queue(guild_id).append(track)
-    await ctx.send(
-        f"➕ Added **{discord.utils.escape_markdown(track.title)}** "
-        f"(`{format_duration(track.duration)}`) to the queue. Position: "
-        f"{len(get_queue(guild_id))}"
-    )
+    queue_position = len(get_queue(guild_id))
+    if status_message is not None:
+        await _set_music_status(
+            ctx,
+            status_message,
+            "✅ Found and queued your song",
+            f"**{discord.utils.escape_markdown(track.title)}**\n"
+            f"Duration: `{format_duration(track.duration)}`\n"
+            f"Queue position: **{queue_position}**",
+            color=discord.Color.green().value,
+        )
+    else:
+        await ctx.send(
+            f"➕ Added **{discord.utils.escape_markdown(track.title)}** "
+            f"(`{format_duration(track.duration)}`) to the queue. Position: "
+            f"{queue_position}"
+        )
     voice = ctx.guild.voice_client
     if voice and not voice.is_playing() and not voice.is_paused():
         await play_next(ctx)
@@ -2042,19 +2115,26 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
         return await ctx.send(
             f"Usage: `{PREFIX}play song name or URL` — or attach an audio file to `{PREFIX}play`."
         )
+    requested_label = query.strip() or (ctx.message.attachments[0].filename if ctx.message.attachments else "attached audio")
+    status_message = await ctx.send(embed=discord.Embed(
+        title="🔎 Looking for your song…",
+        description=f"Request: **{discord.utils.escape_markdown(requested_label[:180])}**\nChecking the source and preparing audio.",
+        color=BRAND_COLOR,
+    ))
     try:
         await ensure_voice(ctx)
     except Exception as exc:
-        return await ctx.send(str(exc))
+        await _set_music_status(ctx, status_message, "⚠️ Couldn't start playback", str(exc), color=discord.Color.orange().value)
+        return
     diag("joined voice, continuing")
 
     attachment = ctx.message.attachments[0] if ctx.message.attachments else None
     if attachment:
         suffix = Path(urlparse(attachment.filename).path).suffix.lower()
         if suffix not in ALLOWED_UPLOAD_SUFFIXES:
-            return await ctx.send("Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.")
+            return await _set_music_status(ctx, status_message, "❌ Unsupported audio file", "Attach an MP3, WAV, Opus, OGG, M4A, or FLAC audio file.", color=discord.Color.red().value)
         if attachment.size > MAX_UPLOAD_MB * 1024 * 1024:
-            return await ctx.send(f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.")
+            return await _set_music_status(ctx, status_message, "❌ File is too large", f"That file is over the bot's {MAX_UPLOAD_MB} MB safety limit.", color=discord.Color.red().value)
         if not query:
             query = attachment.filename
         try:
@@ -2069,10 +2149,10 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
                 local_path=path,
                 source_name="uploaded file",
             )
-            await queue_track(ctx, track)
+            await queue_track(ctx, track, status_message=status_message)
         except Exception as exc:
             clean_temp_file(locals().get("path"))
-            await ctx.send(f"Couldn't save that upload: {exc}")
+            await _set_music_status(ctx, status_message, "❌ Couldn't save that upload", str(exc), color=discord.Color.red().value)
         return
 
     if not query.strip():
@@ -2083,10 +2163,18 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
     # Spotify and Apple Music links may provide metadata or a playable match,
     # but direct catalog audio streaming is not guaranteed or bypassed here.
     await ctx.typing()
+
+    async def _on_play_found(found_title: str) -> None:
+        await _set_music_status(
+            ctx, status_message, "✅ Found a match — preparing audio",
+            f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+            color=BRAND_COLOR,
+        )
+
     try:
-        track = await extract_track(query.strip(), ctx.author.display_name)
+        track = await extract_track(query.strip(), ctx.author.display_name, on_found=_on_play_found)
         diag(f"track ready: {track.title!r}, queueing")
-        await queue_track(ctx, track)
+        await queue_track(ctx, track, status_message=status_message)
     except Exception as exc:
         error_text = str(exc)
         print(f"yt-dlp error: {error_text}", flush=True)
@@ -2096,18 +2184,17 @@ async def play_command(ctx: commands.Context, *, query: str = ""):
             or "sign in to confirm" in lower_error
             or "login required" in lower_error
         ):
-            await ctx.send(
-                "⚠️ YouTube requires sign-in for this request. VaultBot is configured "
-                "to try alternate public YouTube clients without cookies, but YouTube "
-                "can still block particular tracks or this host. Try a different "
-                "public YouTube URL or a SoundCloud link."
+            await _set_music_status(
+                ctx, status_message, "⚠️ Source requires sign-in",
+                "YouTube blocked this request. Try a different public YouTube URL or a SoundCloud link.",
+                color=discord.Color.orange().value,
             )
         else:
-            await ctx.send(
-                "I couldn't find a playable stream for that request. "
-                "For Spotify/Apple Music, direct playback may not be available; "
-                "try a public YouTube/SoundCloud URL or a song title.\n"
-                f"Details: {error_text[:250]}"
+            await _set_music_status(
+                ctx, status_message, "❌ Couldn't find playable audio",
+                "Try a public YouTube/SoundCloud URL or a song title.\n"
+                f"Details: {error_text[:250]}",
+                color=discord.Color.red().value,
             )
 
 
@@ -3733,10 +3820,16 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
     if guild_id in jw_radio_active:
         return await ctx.send("📻 Juice WRLD Radio is already active. Use `~jwradio off` to disable it.")
 
+    status_message = await ctx.send(embed=discord.Embed(
+        title="📻 Starting Juice WRLD Radio…",
+        description="Finding a playable track and preparing the audio.",
+        color=JUICE_COLOR,
+    ))
     try:
         await ensure_voice(ctx)
     except Exception as exc:
-        return await ctx.send(str(exc))
+        await _set_music_status(ctx, status_message, "⚠️ Couldn't start radio", str(exc), color=discord.Color.orange().value)
+        return
 
     # Activate before fetching so ~play and ~jwplay cannot race the radio start.
     jw_radio_active.add(guild_id)
@@ -3754,9 +3847,11 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
         jw_radio_active.discard(guild_id)
         jw_radio_starting.discard(guild_id)
         print(f"[JuiceWRLD Radio] Could not start: {type(exc).__name__}: {exc}")
-        return await ctx.send(
-            "❌ I couldn't start Juice WRLD Radio because the API didn't provide playable audio. "
-            f"Details: {discord.utils.escape_markdown(str(exc))[:180]}"
+        return await _set_music_status(
+            ctx, status_message, "❌ Couldn't start Juice WRLD Radio",
+            "The API didn't provide playable audio. "
+            f"Details: {discord.utils.escape_markdown(str(exc))[:180]}",
+            color=discord.Color.red().value,
         )
     finally:
         jw_radio_starting.discard(guild_id)
@@ -3765,10 +3860,10 @@ async def juicewrld_radio_command(ctx: commands.Context, action: str = "on"):
     # enqueue or start the track after the disable command.
     if guild_id not in jw_radio_active:
         clean_temp_file(track.local_path)
-        return await ctx.send("Juice WRLD Radio was disabled before it could start.")
+        return await _set_music_status(ctx, status_message, "📻 Radio was disabled", "Juice WRLD Radio was disabled before it could start.", color=discord.Color.orange().value)
 
     # The current track is not interrupted; this random track starts next.
-    await queue_track(ctx, track)
+    await queue_track(ctx, track, status_message=status_message)
     await ctx.send(
         "📻 **Juice WRLD Radio is now active!** I'll keep adding random tracks when each song ends. "
         "`~play` and `~jwplay` are blocked until you use `~jwradio off`."
@@ -3791,10 +3886,17 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
 
     # Use the same per-guild Discord voice connection as ~play; never create
     # a second player or a second queue for this command.
+    request_label = "a random Juice WRLD track" if wants_random else query.strip()
+    status_message = await ctx.send(embed=discord.Embed(
+        title="🔎 Searching Juice WRLD…",
+        description=f"Request: **{discord.utils.escape_markdown(request_label[:180])}**\nChecking the catalog now.",
+        color=BRAND_COLOR,
+    ))
     try:
         await ensure_voice(ctx)
     except Exception as exc:
-        return await ctx.send(str(exc))
+        await _set_music_status(ctx, status_message, "⚠️ Couldn't start playback", str(exc), color=discord.Color.orange().value)
+        return
 
     await ctx.typing()
     try:
@@ -3809,15 +3911,23 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
                 entries = _juicewrld_items(payload)
                 audio_files = _jw_audio_candidates(entries, query="", limit=10000)
             if not audio_files:
-                return await ctx.send(
-                    "I couldn't find any playable audio files in the Juice WRLD API listing right now."
+                return await _set_music_status(
+                    ctx, status_message, "❌ No playable Juice WRLD audio found",
+                    "The API listing did not contain a playable audio file right now.",
+                    color=discord.Color.red().value,
                 )
             path, file_info = random.choice(audio_files)
             selected = dict(file_info) if isinstance(file_info, dict) else {}
             selected["path"] = path
             selected["name"] = Path(path).stem.replace("_", " ").replace("-", " ").strip()
+            found_title = str(selected.get("title") or selected.get("name") or "Juice WRLD track")
+            await _set_music_status(
+                ctx, status_message, "✅ Found a track — preparing audio",
+                f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+                color=BRAND_COLOR,
+            )
             track = await _download_juicewrld_track(selected, ctx.author.display_name)
-            await queue_track(ctx, track)
+            await queue_track(ctx, track, status_message=status_message)
             return
 
         payload = await _juicewrld_api_get(
@@ -3829,8 +3939,10 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
             if isinstance(item, dict) and item.get("id") is not None
         ]
         if not songs:
-            return await ctx.send(
-                f"No Juice WRLD catalog results found for **{discord.utils.escape_markdown(query[:100])}**."
+            return await _set_music_status(
+                ctx, status_message, "❌ No catalog match found",
+                f"No Juice WRLD catalog results found for **{discord.utils.escape_markdown(query[:100])}**.",
+                color=discord.Color.red().value,
             )
 
         songs.sort(key=lambda item: _jw_song_score(item, query), reverse=True)
@@ -3853,18 +3965,27 @@ async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
                 break
 
         if selected is None:
-            return await ctx.send(
+            return await _set_music_status(
+                ctx, status_message, "⚠️ Song found, but no playable audio",
                 f"I found **{discord.utils.escape_markdown(str(songs[0].get('name') or query)[:100])}**, "
-                "but the catalog results did not include a downloadable audio file. Try another title or `~jwfiles`."
+                "but the catalog results did not include a downloadable audio file. Try another title or `~jwfiles`.",
+                color=discord.Color.orange().value,
             )
 
+        found_title = str(selected.get("title") or selected.get("name") or query)
+        await _set_music_status(
+            ctx, status_message, "✅ Found a match — preparing audio",
+            f"**{discord.utils.escape_markdown(found_title[:180])}**\nDownloading audio and adding it to the shared queue…",
+            color=BRAND_COLOR,
+        )
         track = await _download_juicewrld_track(selected, ctx.author.display_name)
-        await queue_track(ctx, track)
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError) as exc:
+        await queue_track(ctx, track, status_message=status_message)
+    except Exception as exc:
         print(f"[JuiceWRLD] Playback request failed: {type(exc).__name__}: {exc}")
-        await ctx.send(
-            "I couldn't fetch playable audio for that Juice WRLD search. "
-            f"Details: {discord.utils.escape_markdown(str(exc))[:220]}"
+        await _set_music_status(
+            ctx, status_message, "❌ Couldn't fetch playable audio",
+            f"Details: {discord.utils.escape_markdown(str(exc))[:220]}",
+            color=discord.Color.red().value,
         )
 
 
