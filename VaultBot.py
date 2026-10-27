@@ -3173,7 +3173,7 @@ async def juicewrld_lyrics_search(ctx: commands.Context, *, phrase: str):
 @bot.command(name="jwcover")
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def juicewrld_cover(ctx: commands.Context, *, query: str):
-    """Search community cover art and show the first matching image with links to more."""
+    """Search community cover art and display every result directly in Discord."""
     try:
         payload = await _jw_get_json_url("https://wrld.pure0.lol/api/covers/", params={"search": query})
         images = payload.get("images", []) if isinstance(payload, dict) else []
@@ -3195,12 +3195,17 @@ async def juicewrld_cover(ctx: commands.Context, *, query: str):
                 break
         if not urls:
             return await ctx.send(f"No cover art found for **{discord.utils.escape_markdown(query[:100])}**. The cover service may also be unavailable.")
-        embed = discord.Embed(title=f"🎨 Cover art: {query[:180]}", description=f"Found **{len(urls)}** cover image(s).", color=JUICE_COLOR)
-        embed.set_image(url=urls[0])
-        if len(urls) > 1:
-            embed.add_field(name="More covers", value="\n".join(f"[{i}. Open cover]({url})" for i, url in enumerate(urls[1:10], start=2)), inline=False)
-        embed.set_footer(text="Source: WRLD cover API • Open links to view other results")
-        await ctx.send(embed=embed)
+
+        # Discord allows up to 10 embeds per message. Give each cover its own image
+        # embed, so users can see the results in chat rather than opening each link.
+        await ctx.send(f"🎨 Found **{len(urls)}** cover image(s) for **{discord.utils.escape_markdown(query[:100])}**:")
+        for offset in range(0, len(urls), 10):
+            embeds = []
+            for index, url in enumerate(urls[offset:offset + 10], start=offset + 1):
+                embed = discord.Embed(title=f"Cover art: {query[:150]} · {index}/{len(urls)}", color=JUICE_COLOR)
+                embed.set_image(url=url)
+                embeds.append(embed)
+            await ctx.send(embeds=embeds)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         print(f"[JuiceWRLD] Cover lookup failed: {type(exc).__name__}: {exc}")
         await ctx.send("The cover-art service is unavailable right now. Please try again later.")
