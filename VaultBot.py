@@ -527,7 +527,6 @@ async def play_next(ctx: commands.Context) -> None:
         if not voice or not voice.is_connected():
             current_tracks.pop(guild_id, None)
             return
-
         previous = current_tracks.get(guild_id)
         mode = loop_modes.get(guild_id, "off")
         if previous and mode == "song":
@@ -1001,16 +1000,22 @@ HELP_PAGES: list[dict] = [
     },
     {
         "key": "juice",
-        "aliases": ("jw", "jwsong", "tracker", "juicewrld"),
+        "aliases": ("jw", "jwplay", "jwsong", "tracker", "juicewrld"),
         "emoji": "🧃",
         "title": "Juice WRLD Tools",
-        "summary": "Catalog search and automatic tracker updates",
+        "summary": "Catalog search, shared-queue playback, and tracker updates",
         "color": JUICE_COLOR,
         "description": (
-            "Catalog features powered by the Juice WRLD API. Information only — "
-            "these tools don't play audio."
+            "Catalog tools powered by the Juice WRLD API. `~jwplay` queues available "
+            "catalog audio in the same per-server player and queue as `~play`."
         ),
         "fields": [
+            (
+                f"`{PREFIX}jwplay <song>`",
+                "Searches for a Juice WRLD catalog match and queues its available audio in the same queue as "
+                f"`{PREFIX}play`. It will not interrupt a song already playing.\n"
+                f"Example: `{PREFIX}jwplay lucid dreams`",
+            ),
             (
                 f"`{PREFIX}jwsong <search>`",
                 "Searches the Juice WRLD catalog, opens a detailed song embed, "
@@ -3346,6 +3351,161 @@ async def juicewrld_files(ctx: commands.Context, *, query: str):
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
         print(f"[JuiceWRLD] File search failed: {type(exc).__name__}: {exc}")
         await ctx.send("The Juice WRLD file browser is unavailable right now. Please try again later.")
+
+
+def _jw_parse_duration(song: dict) -> Optional[int]:
+    """Read a numeric duration or a MM:SS / HH:MM:SS catalog length."""
+    for key in ("duration_seconds", "duration", "length"):
+        value = song.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            raw = value.strip()
+            if raw.isdigit():
+                seconds = int(raw)
+                if seconds > 0:
+                    return seconds
+            if re.fullmatch(r"\d{1,3}:\d{1,2}(?::\d{1,2})?", raw):
+                try:
+                    parts = [int(part) for part in raw.split(":")]
+                    total = 0
+                    for part in parts:
+                        total = total * 60 + part
+                    if total > 0:
+                        return total
+                except ValueError:
+                    pass
+    return None
+
+
+async def _download_juicewrld_track(song: dict, requester: str) -> Track:
+    """Download one API-linked audio file into VaultBot's normal temp-track format."""
+    raw_path = song.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("This catalog result does not have a downloadable audio path.")
+
+    remote_path = raw_path.strip().replace("\\", "/")
+    if remote_path.startswith(("http://", "https://")) or ".." in remote_path.split("/"):
+        raise ValueError("The API returned an invalid audio path.")
+
+    suffix = Path(remote_path).suffix.lower()
+    if suffix not in {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac", ".aac", ".mp4"}:
+        suffix = ".mp3"
+
+    folder = Path(tempfile.mkdtemp(prefix="vaultbot_audio_"))
+    local_path = folder / f"juicewrld{suffix}"
+    url = f"{JUICEWRLD_API_BASE}/files/download/"
+    params = {"path": remote_path}
+    headers = {"Accept": "audio/*, application/octet-stream"}
+    if JUICEWRLD_API_KEY:
+        headers["X-API-Key"] = JUICEWRLD_API_KEY
+
+    # Keep a ceiling so a malformed API result cannot fill the host's disk.
+    max_bytes = 200 * 1024 * 1024
+    total_bytes = 0
+    timeout = aiohttp.ClientTimeout(total=300, sock_connect=20, sock_read=60)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "application/json" in content_type or "text/html" in content_type:
+                    detail = (await response.text())[:180]
+                    raise ValueError(f"The API did not return audio data. {detail}")
+                with local_path.open("wb") as output:
+                    async for chunk in response.content.iter_chunked(128 * 1024):
+                        if not chunk:
+                            continue
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise ValueError("The audio file exceeds VaultBot's 200 MB limit.")
+                        output.write(chunk)
+        if total_bytes == 0:
+            raise ValueError("The API returned an empty audio file.")
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+    title = str(song.get("name") or song.get("title") or Path(remote_path).stem or "Juice WRLD track")
+    song_id = song.get("id")
+    webpage_url = (
+        f"{JUICEWRLD_API_BASE}/songs/{int(song_id)}/"
+        if song_id is not None and str(song_id).isdigit()
+        else "https://juicewrldapi.com/"
+    )
+    path_text = str(local_path)
+    TEMP_FILES.add(path_text)
+    return Track(
+        title=title,
+        webpage_url=webpage_url,
+        requester=requester,
+        local_path=path_text,
+        duration=_jw_parse_duration(song),
+        source_name="Juice WRLD API",
+    )
+
+
+@bot.command(name="jwplay", aliases=["jwp"])
+async def juicewrld_play_command(ctx: commands.Context, *, query: str = ""):
+    """Search the Juice WRLD API and queue its audio in the shared music player."""
+    if not ctx.guild:
+        return await ctx.send("Use this command inside a server.")
+    if not query.strip():
+        return await ctx.send(f"Usage: `{PREFIX}jwplay song name` — adds a Juice WRLD catalog track to the shared queue.")
+
+    # Use the same per-guild Discord voice connection as ~play; never create
+    # a second player or a second queue for this command.
+    try:
+        await ensure_voice(ctx)
+    except Exception as exc:
+        return await ctx.send(str(exc))
+
+    await ctx.typing()
+    try:
+        payload = await _juicewrld_api_get(
+            "/songs/",
+            params={"search": query.strip(), "page_size": 25, "versions": "true"},
+        )
+        songs = [
+            item for item in _juicewrld_items(payload)
+            if isinstance(item, dict) and item.get("id") is not None
+        ]
+        if not songs:
+            return await ctx.send(
+                f"No Juice WRLD catalog results found for **{discord.utils.escape_markdown(query[:100])}**."
+            )
+
+        songs.sort(key=lambda item: _jw_song_score(item, query), reverse=True)
+        selected = None
+        # Search results usually include `path`; when not, try a few details
+        # records in rank order so one metadata-only result doesn't block playback.
+        for candidate in songs[:8]:
+            item = dict(candidate)
+            if not item.get("path") and str(item.get("id", "")).isdigit():
+                try:
+                    detail = await _juicewrld_api_get(f"/songs/{int(item['id'])}/")
+                    if isinstance(detail, dict):
+                        item.update(detail)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
+                    print(f"[JuiceWRLD] Audio detail lookup failed: {exc}")
+            if isinstance(item.get("path"), str) and item["path"].strip():
+                selected = item
+                break
+
+        if selected is None:
+            return await ctx.send(
+                f"I found **{discord.utils.escape_markdown(str(songs[0].get('name') or query)[:100])}**, "
+                "but the catalog results did not include a downloadable audio file. Try another title or `~jwfiles`."
+            )
+
+        track = await _download_juicewrld_track(selected, ctx.author.display_name)
+        await queue_track(ctx, track)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, TypeError) as exc:
+        print(f"[JuiceWRLD] Playback request failed: {type(exc).__name__}: {exc}")
+        await ctx.send(
+            "I couldn't fetch playable audio for that Juice WRLD search. "
+            f"Details: {discord.utils.escape_markdown(str(exc))[:220]}"
+        )
 
 
 @bot.command(name="jwsong", aliases=["jwsearch", "jwmusicsearch"])
@@ -7260,7 +7420,7 @@ def _vault_control_embed(page: str, guild: Optional[discord.Guild]) -> discord.E
         modules = [
             ('🎮 GAME RADAR', '`/freestuff` • `/patchnotes`', 'Free offers, Steam game announcements, and supported game feeds.'),
             ('🎵 MUSIC ENGINE', '`~play` • `~queue` • `~nowplaying`', 'Voice playback and queue controls.'),
-            ('🖤 JUICE WRLD', '`~jwsong`', 'Song/catalog search and optional tracker notifications.'),
+            ('🖤 JUICE WRLD', '`~jwplay` • `~jwsong`', 'Queues available catalog audio in the shared music queue and searches song metadata.'),
             ('🛡️ MODERATION', '`~ban` • `~timeout` • `~clear`', 'Server moderation tools, subject to permissions.'),
         ]
         for name, commands_text, description in modules:
