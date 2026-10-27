@@ -3637,9 +3637,22 @@ async def _jw_download_image(session: aiohttp.ClientSession, url: str, max_bytes
             if resp.status != 200:
                 print(f"[jwcover] HTTP {resp.status} for {url}", flush=True)
                 return None
-            data = await resp.content.read(max_bytes + 1)
-            if len(data) > max_bytes:
-                print(f"[jwcover] too large (> {max_bytes} bytes): {url}", flush=True)
+            # Read the WHOLE body in chunks (StreamReader.read(n) can return a partial chunk,
+            # which produced truncated, half-grey images).
+            chunks, total = [], 0
+            async for chunk in resp.content.iter_chunked(65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    print(f"[jwcover] too large (> {max_bytes} bytes): {url}", flush=True)
+                    return None
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            expected = resp.content_length
+            if expected is not None and not resp.headers.get("Content-Encoding") and len(data) != expected:
+                print(f"[jwcover] incomplete download ({len(data)}/{expected} bytes): {url}", flush=True)
+                return None
+            if not data:
+                print(f"[jwcover] empty response: {url}", flush=True)
                 return None
             ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
             ext = _jw_sniff_image_ext(data) or _JW_IMG_EXT.get(ctype)
@@ -6602,6 +6615,119 @@ async def _fetch_fortnite() -> list:
     return items
 
 
+_HYPEX_IMG_CACHE: dict = {}
+
+
+def _hypex_image_ok(url: str) -> bool:
+    """True if a URL looks like a real post image (not an avatar, emoji, or video file)."""
+    low = url.lower()
+    parsed = urlparse(url)
+    host, path = parsed.netloc.lower(), parsed.path.lower()
+    if "profile_images" in path or "/emoji/" in path or "abs.twimg.com/emoji" in low:
+        return False
+    # X/Twitter media URLs often have NO file extension: pbs.twimg.com/media/ID?format=jpg&name=large
+    if host.endswith("twimg.com") and any(
+        part in path for part in ("/media/", "/ext_tw_video_thumb/", "/amplify_video_thumb/",
+                                  "/tweet_video_thumb/", "/card_img/")
+    ):
+        return True
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        return True
+    return bool(re.search(r"[?&]format=(jpg|jpeg|png|webp|gif)\b", low))
+
+
+def _hypex_normalize_image(url, strict: bool = True) -> Optional[str]:
+    if not isinstance(url, str):
+        return None
+    url = html.unescape(url.strip())
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    if not url.startswith("https://"):
+        return None
+    if strict and not _hypex_image_ok(url):
+        return None
+    return url
+
+
+def _hypex_pick_image(entry, description_html: str) -> Optional[str]:
+    """Find the post's picture: feed media tags first, then <img>/<video poster> inside the post HTML."""
+    candidates = []
+    for node in entry.iter():
+        tag = node.tag if isinstance(node.tag, str) else ""
+        attrs = node.attrib
+        if tag.endswith(("}content", "}thumbnail")) or tag in ("content", "thumbnail", "enclosure"):
+            if attrs.get("url"):
+                candidates.append(attrs["url"])
+        if (tag.endswith("}link") or tag == "link") and attrs.get("rel") == "enclosure" and attrs.get("href"):
+            candidates.append(attrs["href"])
+    # The feed usually embeds the picture as <img src="..."> inside the description HTML,
+    # which html_to_text() strips out, so look for it BEFORE converting to plain text.
+    for match in re.finditer(r"""(?is)<(?:img|source|video)\b[^>]*?\b(?:src|poster)\s*=\s*["']([^"']+)["']""",
+                             description_html or ""):
+        candidates.append(match.group(1))
+    for candidate in candidates:
+        normalized = _hypex_normalize_image(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _hypex_image_from_api(data) -> Optional[str]:
+    """Pull a photo (or video thumbnail) from an FxTwitter API JSON response."""
+    tweet = data.get("tweet") if isinstance(data, dict) else None
+    if not isinstance(tweet, dict):
+        return None
+    for holder in (tweet, tweet.get("quote")):
+        media = holder.get("media") if isinstance(holder, dict) else None
+        if not isinstance(media, dict):
+            continue
+        for photo in media.get("photos") or []:
+            found = _hypex_normalize_image(photo.get("url") if isinstance(photo, dict) else None, strict=False)
+            if found:
+                return found
+        for video in media.get("videos") or []:
+            found = _hypex_normalize_image(video.get("thumbnail_url") if isinstance(video, dict) else None, strict=False)
+            if found:
+                return found
+    return None
+
+
+async def _hypex_fill_missing_images(items: list) -> None:
+    """Fallback: ask the FxTwitter API for the picture of any post whose feed entry had none."""
+    missing = [item for item in items if not item.get("image")]
+    if not missing:
+        return
+    timeout = aiohttp.ClientTimeout(total=12)
+    headers = {"Accept": "application/json", "User-Agent": "VaultBot/1.0 (+Discord Fortnite update feed)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for item in missing:
+            match = re.search(r"(?:x|twitter|fxtwitter|fixupx)\.com/([^/]+)/status/(\d+)",
+                              str(item.get("url") or ""), flags=re.IGNORECASE)
+            if not match:
+                continue
+            user, status_id = match.groups()
+            if status_id in _HYPEX_IMG_CACHE:
+                item["image"] = _HYPEX_IMG_CACHE[status_id] or None
+                continue
+            image = None
+            try:
+                async with session.get(f"https://api.fxtwitter.com/{user}/status/{status_id}") as resp:
+                    if resp.status == 200:
+                        image = _hypex_image_from_api(await resp.json(content_type=None))
+                    elif resp.status != 404:
+                        print(f"[PatchNotes] HYPEX image lookup HTTP {resp.status} for {status_id}", flush=True)
+                        continue  # transient problem: don't cache, retry next poll
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                print(f"[PatchNotes] HYPEX image lookup failed for {status_id}: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            _HYPEX_IMG_CACHE[status_id] = image or ""
+            while len(_HYPEX_IMG_CACHE) > 500:
+                _HYPEX_IMG_CACHE.pop(next(iter(_HYPEX_IMG_CACHE)))
+            item["image"] = image
+
+
 async def _fetch_hypex() -> list:
     """Read recent HYPEX posts through public FxEmbed RSS/Atom feed endpoints.
 
@@ -6666,6 +6792,7 @@ async def _fetch_hypex() -> list:
         guid = child_text(["guid", "id", "{http://www.w3.org/2005/Atom}id"]) or link or title
         description = child_text(["description", "{http://www.w3.org/2005/Atom}content", "{http://www.w3.org/2005/Atom}summary"])
         description = html.unescape(description)
+        description_html = description
         description = html_to_text(description, 3000)
         date_text = child_text(["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}published", "{http://www.w3.org/2005/Atom}updated"])
         try:
@@ -6673,13 +6800,7 @@ async def _fetch_hypex() -> list:
         except (TypeError, ValueError, OverflowError):
             date_value = _parse_date(date_text)
 
-        image = None
-        for node in entry.iter():
-            if node.tag.endswith("}content") or node.tag.endswith("}thumbnail") or node.tag == "enclosure":
-                candidate = node.attrib.get("url")
-                if candidate and candidate.startswith("https://") and any(ext in candidate.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                    image = candidate
-                    break
+        image = _hypex_pick_image(entry, description_html)
         if not link.startswith(("https://", "http://")):
             link = "https://x.com/HYPEX"
         if not description:
@@ -6698,7 +6819,12 @@ async def _fetch_hypex() -> list:
             "source": "HYPEX // UNOFFICIAL SOURCE",
         })
     items.sort(key=lambda item: int(item.get("date") or 0), reverse=True)
-    return items[:8]
+    items = items[:8]
+    try:
+        await _hypex_fill_missing_images(items)
+    except Exception as exc:  # a picture lookup must never block an alert
+        print(f"[PatchNotes] HYPEX image fallback failed: {type(exc).__name__}: {exc}", flush=True)
+    return items
 
 
 FEEDS = {
