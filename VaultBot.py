@@ -1050,6 +1050,12 @@ HELP_PAGES: list[dict] = [
                 "True to include an @everyone ping (off by default).",
             ),
             (
+                "`/serverwidget`",
+                "Displays the server widget's online count, total members, voice-channel "
+                "activity, and a Join Server button when Discord provides an invite. "
+                "Enable Server Widget in Server Settings first.",
+            ),
+            (
                 "`/ping`",
                 "Checks that the bot is online and shows its latency. "
                 "Only you can see the reply.",
@@ -2596,6 +2602,88 @@ async def ping(interaction: discord.Interaction):
         f"Pong! Bot latency: {round(bot.latency * 1000)} ms",
         ephemeral=True
     )
+
+
+@bot.tree.command(
+    name="serverwidget",
+    description="Show this server's widget stats and join link"
+)
+async def server_widget(interaction: discord.Interaction):
+    """Display Discord's enabled server-widget data as a native Discord embed."""
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "Use this command inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    try:
+        widget = await guild.widget()
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I couldn't access the server widget. Make sure **Enable Server Widget** "
+            "is turned on in **Server Settings → Widget**.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "Discord couldn't load the server widget right now. Please try again.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"🌐 {widget.name}",
+        description="**SERVER WIDGET // LIVE OVERVIEW**",
+        color=BRAND_COLOR,
+    )
+    embed.add_field(
+        name="👥 Members",
+        value=f"{guild.member_count:,}" if guild.member_count is not None else "Unavailable",
+        inline=True,
+    )
+    embed.add_field(
+        name="🟢 Online",
+        value=(
+            f"{widget.presence_count:,}"
+            if widget.presence_count is not None
+            else "Unavailable"
+        ),
+        inline=True,
+    )
+
+    voice_channels = list(guild.voice_channels)
+    connected_members = sum(len(channel.members) for channel in voice_channels)
+    embed.add_field(
+        name="🎙️ Voice Channels",
+        value=f"{len(voice_channels):,}",
+        inline=True,
+    )
+    embed.add_field(
+        name="🔊 In Voice",
+        value=f"{connected_members:,}",
+        inline=True,
+    )
+
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.set_footer(text="VAULTBOT SYSTEMS • SERVER WIDGET")
+
+    view = discord.ui.View(timeout=120)
+    if widget.instant_invite:
+        view.add_item(discord.ui.Button(
+            label="Join Server",
+            emoji="🔗",
+            style=discord.ButtonStyle.link,
+            url=widget.instant_invite,
+        ))
+
+    await interaction.followup.send(embed=embed, view=view if view.children else None)
 
 
 @bot.tree.command(
