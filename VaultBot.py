@@ -76,9 +76,10 @@ JUICE_COLOR = discord.Color.from_rgb(123, 44, 191)
 # Music settings.
 DEFAULT_VOLUME = 0.5
 MAX_VOLUME_PERCENT = 200  # 100 = original loudness; above that the audio is amplified
-# MP3 bitrate requested from the Juice WRLD API for playback/radio (was 160k). If the API rejects it,
-# VaultBot automatically falls back to the original file, so this is safe to change.
-JW_PLAYBACK_BITRATE = "320k"
+# MP3 bitrate requested from the Juice WRLD API for playback/radio. The API answered "406 Not Acceptable"
+# to 320k for every track, so keep this at 160k (the value that worked). If you try another value, watch the
+# console: repeated "406" lines mean the API rejects it and every song falls back to the slower original file.
+JW_PLAYBACK_BITRATE = "160k"
 ALLOWED_UPLOAD_SUFFIXES = {".mp3", ".wav", ".opus", ".ogg", ".m4a", ".flac"}
 MAX_UPLOAD_MB = 20
 
